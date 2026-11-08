@@ -2,7 +2,7 @@
 
 Helios is a proof-of-concept **HR Intelligence Copilot** for a synthetic organization (Northstar Global, ~120 employees). It is designed as an **operations assistant**, not a FAQ chatbot: it classifies requests, enforces authorization in Python, retrieves enterprise records and policies, computes leave and analytics deterministically, and requires human confirmation before consequential writes.
 
-The demo organization clock is fixed at **7 November 2026** so leave windows, Project Atlas deadlines, and attendance periods stay stable across demos.
+
 
 ---
 

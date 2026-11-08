@@ -1,0 +1,25 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+}
+
+body {
+  min-height: 100vh;
+  overflow-x: clip;
+  background:
+    radial-gradient(1200px 500px at 100% -10%, rgba(156, 91, 60, 0.08), transparent 50%),
+    #f3eee6;
+  color: #142233;
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #cfc4b6 transparent;
+}
+
+::selection {
+  background: #ead7c8;
+}

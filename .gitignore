@@ -1,0 +1,16 @@
+__pycache__/
+.pytest_cache/
+.venv/
+venv/
+.env
+*.pyc
+backend/data/*.db
+backend/data/*.sqlite
+backend/data/*.sqlite-journal
+backend/data/models/
+frontend/node_modules/
+frontend/.next/
+frontend/.env.local
+frontend/tsconfig.tsbuildinfo
+.DS_Store
+artifacts/_eval_runner/

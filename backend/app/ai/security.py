@@ -233,12 +233,17 @@ _CROSS_USER = re.compile(
     r"\b(?:(?:other|another|all|every|previous|prior|different|the\s+last|someone\s+else'?s?|anyone\s+else'?s?|everyone'?s?)\s+"
     r"(?:users?'?|people'?s?|employees?'?|sessions?'?|accounts?'?|colleagues?'?)\s*(?:'s)?\s*(?:private\s+)?"
     r"(?:chats?|conversations?|sessions?|messages?|memory|history|transcripts?|logs?|prompts?|questions?|queries)|"
-    r"(?:conversation|chat|session|assistant|bot)\s+(?:memory|history|logs?|transcripts?|records?)\s+(?:for|of|from)\s+(?:other|another|all|every|different|everyone)|"
-    r"dump\s+(?:the\s+|all\s+)?(?:conversation|chat|session)\s+(?:memory|history|logs?)|"
-    r"what\s+(?:did|has|have)\s+(?:the\s+)?(?:other|another|others?|previous|prior|last)\s+(?:users?|people|employees?|accounts?)\s+(?:asked|said|searched|typed|requested)|"
-    r"what\s+(?:the\s+)?(?:other|another|previous|prior|last)\s+(?:users?|people|employees?|accounts?)\s+(?:asked|said|searched|typed|requested)|"
+    r"(?:conversation|chat|session|assistant|bot)\s+(?:memory|history|logs?|transcripts?|records?)\s+(?:for|of|from)\s+(?:other|another|all|every|different|everyone|user\s+\w+|[a-z][\w.-]+)|"
+    r"(?:open|show|dump|reveal|print|read|export|fetch|retrieve)\s+(?:the\s+)?(?:conversation|chat|session)\s+history\s+(?:for|of|from)\s+(?:user\s+)?\w+|"
+    r"dump\s+(?:the\s+|all\s+|their\s+|his\s+|her\s+)?(?:conversation|chat|session|messages?|questions?|queries|transcripts?)|"
+    r"what\s+(?:did|has|have)\s+(?:the\s+)?(?:other|another|others?|previous|prior|last)\s+(?:users?|people|employees?|accounts?)\s+(?:ask(?:ed|ing|s)?|said|searched|typed|requested)|"
+    r"what\s+(?:the\s+)?(?:other|another|previous|prior|last)\s+(?:users?|people|employees?|accounts?)\s+(?:ask(?:ed|ing|s)?|said|searched|typed|requested)|"
+    r"what\s+did\s+[a-z][\w.-]*(?:\s+[a-z][\w.-]+)?\s+ask(?:\s+about)?|"
+    r"(?:show|dump|reveal|print|read|export)\s+(?:me\s+)?[a-z][\w.-]*(?:\s+[a-z][\w.-]*)?'s\s+(?:previous\s+|prior\s+|last\s+)?"
+    r"(?:chat\s+|conversation\s+|session\s+|assistant\s+)?(?:transcript|history|memory|messages?|questions?|queries)|"
+    r"(?:their|his|her)\s+(?:previous\s+|prior\s+|last\s+)?(?:chat|conversation|session)\s+(?:transcript|history|memory|log)|"
     r"(?:their|his|her)\s+session\s+(?:history|memory|transcript|log)|"
-    r"(?:replay|show|dump|reveal|print|read)\s+(?:the\s+)?(?:chat|conversation|session)\s+(?:history|memory|logs?|transcripts?)\s+(?:of|from|for)\s+(?:other|another|all|every|previous|different)|"
+    r"(?:replay|show|dump|reveal|print|read)\s+(?:the\s+)?(?:chat|conversation|session)\s+(?:history|memory|logs?|transcripts?)\s+(?:of|from|for)\s+(?:other|another|all|every|previous|different|user\s+\w+|\w+)|"
     r"memory\s+(?:for|of|from)\s+(?:other|another|all|every)\s+users?|(?:other|another|previous|prior)\s+users?'?\s+(?:data|memory|history|session|questions?|chats?))\b",
     re.IGNORECASE,
 )
@@ -571,9 +576,23 @@ def _bulk_personal_export(text: str, role: str) -> SecurityFinding | None:
 def _cross_user_memory(text: str) -> SecurityFinding | None:
     hit = _CROSS_USER.search(text)
     hidden = re.search(r"\b(?:hidden|internal|secret|undocumented)\s+(?:tools?|functions?|commands?)\b", text, re.IGNORECASE)
-    if not hit and not hidden:
+    # Named person's transcript / prior assistant chat / dump their questions.
+    named = re.search(
+        r"\b(?:show|dump|reveal|print|read|export|open)\b.{0,80}\b(?:transcript|chat history|conversation history|"
+        r"previous chat|prior chat|last conversation|her questions|his questions|their questions)\b",
+        text,
+        re.IGNORECASE,
+    ) or re.search(
+        r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?'s\b.{0,40}\b(?:transcript|chat|conversation|questions?|memory|history)\b",
+        text,
+    ) or re.search(
+        r"\bwhat did\b.{0,40}\bask\b.{0,40}\b(?:conversation|assistant|chat|you)\b",
+        text,
+        re.IGNORECASE,
+    )
+    if not hit and not hidden and not named:
         return None
-    evidence = [match.group(0) for match in (hit, hidden) if match]
+    evidence = [match.group(0) for match in (hit, hidden, named) if match]
     return SecurityFinding(
         "cross_user_memory",
         evidence,

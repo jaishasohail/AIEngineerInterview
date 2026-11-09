@@ -8,6 +8,7 @@ from datetime import date
 
 from sqlalchemy.orm import Session
 
+from app.access import direct_report_ids, employee_for_user
 from app.clock import org_today, shift_months
 from app.models import Attendance, Department, Employee, LeaveBalance, User
 from app.services.records import complete_month_series
@@ -18,12 +19,10 @@ UNPLANNED = {"absent", "sick"}
 def _scope(db: Session, actor: User) -> tuple[str, list[int] | None, str | None]:
     if actor.role == "hr_admin":
         return "organization", None, None
-    employee = db.get(Employee, actor.employee_id)
-    assert employee is not None
+    employee = employee_for_user(db, actor)
     if actor.role == "manager":
-        department = db.get(Department, employee.department_id)
-        return "department", [employee.department_id], None if department is None else department.name
-    return "self", [employee.department_id], employee.full_name
+        return "team", direct_report_ids(db, employee.id), f"{employee.full_name}'s direct reports"
+    return "self", [employee.id], employee.full_name
 
 
 def _rate(numerator: int, denominator: int) -> float:
@@ -33,13 +32,21 @@ def _rate(numerator: int, denominator: int) -> float:
 
 
 def _employees_in_scope(db: Session, actor: User) -> list[Employee]:
+    """HR Admin: org. Manager: authorized direct reports only. Employee: self only.
+
+    Attendance rows are filtered to these ids before aggregation — never load org-wide
+    rows and filter afterward for managers.
+    """
+    actor_employee = employee_for_user(db, actor)
     employee_query = db.query(Employee).filter(Employee.employment_status == "active")
+    if actor.role == "hr_admin":
+        return employee_query.all()
     if actor.role == "manager":
-        actor_employee = db.get(Employee, actor.employee_id)
-        employee_query = employee_query.filter(Employee.department_id == actor_employee.department_id)
-    elif actor.role == "employee":
-        employee_query = employee_query.filter(Employee.id == actor.employee_id)
-    return employee_query.all()
+        allowed = list(direct_report_ids(db, actor_employee.id))
+        if not allowed:
+            return []
+        return employee_query.filter(Employee.id.in_(allowed)).all()
+    return employee_query.filter(Employee.id == actor_employee.id).all()
 
 
 def absence_analytics(db: Session, actor: User, months: int = 3) -> dict:
@@ -71,6 +78,10 @@ def absence_analytics(db: Session, actor: User, months: int = 3) -> dict:
     monthly = defaultdict(lambda: {"scheduled_days": 0, "unplanned_absent": 0})
     location_monthly = defaultdict(lambda: {"scheduled_days": 0, "unplanned_absent": 0})
     personal_monthly = defaultdict(lambda: {"scheduled_days": 0, "present": 0, "remote": 0, "leave": 0, "unplanned": 0})
+    employee_unplanned: dict[int, int] = defaultdict(int)
+    employee_scheduled: dict[int, int] = defaultdict(int)
+    name_of = {employee.id: employee.full_name for employee in employees}
+    number_of = {employee.id: employee.employee_number for employee in employees}
 
     for row in rows:
         department = dept_of.get(row.employee_id)
@@ -78,6 +89,7 @@ def absence_analytics(db: Session, actor: User, months: int = 3) -> dict:
             continue
         bucket = dept_totals[department]
         bucket["scheduled_days"] += 1
+        employee_scheduled[row.employee_id] += 1
         month_key = row.work_date.strftime("%Y-%m")
         month_bucket = monthly[(month_key, department)]
         month_bucket["scheduled_days"] += 1
@@ -91,6 +103,7 @@ def absence_analytics(db: Session, actor: User, months: int = 3) -> dict:
             bucket["unplanned_absent"] += 1
             month_bucket["unplanned_absent"] += 1
             loc_bucket["unplanned_absent"] += 1
+            employee_unplanned[row.employee_id] += 1
             if actor.role == "employee":
                 personal["unplanned"] += 1
         elif row.status == "leave":
@@ -160,12 +173,31 @@ def absence_analytics(db: Session, actor: User, months: int = 3) -> dict:
     office_comparison = _office_comparison(location_monthly_rows, compare_months)
     investigation = _investigation_ranking(department_rows, month_comparison, anomalies)
     recommendations = _recommendations(investigation, month_comparison, office_comparison, anomalies, scope)
+    priority_employees = []
+    for employee_id, unplanned in sorted(employee_unplanned.items(), key=lambda item: (-item[1], name_of.get(item[0], ""))):
+        scheduled = employee_scheduled.get(employee_id, 0)
+        if unplanned <= 0:
+            continue
+        priority_employees.append(
+            {
+                "full_name": name_of.get(employee_id, ""),
+                "employee_number": number_of.get(employee_id, ""),
+                "department": dept_of.get(employee_id, ""),
+                "unplanned_absent": unplanned,
+                "scheduled_days": scheduled,
+                "unplanned_absence_rate": _rate(unplanned, scheduled),
+            }
+        )
+        if len(priority_employees) >= 12:
+            break
 
     personal_rows = [{"month": month, **bucket} for month, bucket in sorted(personal_monthly.items())]
     return {
         "period": {"start": start.isoformat(), "end": today.isoformat(), "months": months},
         "scope": scope,
         "scope_label": scope_label,
+        # IDs used for the attendance query — never an unfiltered org pull for managers.
+        "employee_ids": list(employee_ids),
         "method": (
             "Unplanned absence counts attendance statuses absent and sick. "
             "The denominator is weekday attendance rows in the period. "
@@ -180,6 +212,7 @@ def absence_analytics(db: Session, actor: User, months: int = 3) -> dict:
         "month_comparison": month_comparison,
         "office_comparison": office_comparison,
         "investigation": investigation,
+        "priority_employees": priority_employees,
         "recommendations": recommendations,
         "anomalies": anomalies,
         "leave_utilization": [

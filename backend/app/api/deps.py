@@ -16,6 +16,11 @@ def get_current_user(
     db: Session = Depends(get_db),
     authorization: str | None = Header(default=None),
 ) -> User:
+    """Authenticate from JWT, then load the live User row.
+
+    Role and employee linkage always come from the database — never from JWT claims —
+    so forged role/employee_id fields cannot escalate privileges.
+    """
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="Sign in required")
     token = authorization.split(" ", 1)[1].strip()

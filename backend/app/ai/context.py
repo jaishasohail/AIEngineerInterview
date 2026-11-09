@@ -15,7 +15,7 @@ from app.access import (
     redact_employee,
 )
 from app.ai.guard import detect_injection, sensitive_kinds, wants_bulk_export
-from app.ai.llm import LLMClient, parse_json_object
+from app.ai.llm import LLMClient
 from app.audit import write_audit
 from app.models import Department, Employee, User
 
@@ -56,6 +56,8 @@ class RequestCtx:
     db: Session
     user_id: int
     ip: str | None = None
+    conversation_id: int | None = None
+    thread_id: str | None = None
 
 
 CTX: ContextVar[RequestCtx | None] = ContextVar("helios_request_ctx", default=None)
@@ -157,9 +159,22 @@ def remote_attendance_question(text: str) -> bool:
 
 
 def post_approval_question(text: str) -> bool:
-    """What happens after approval. The HR phrase 'after a manager approves' stays an HR action."""
+    """Policy ask about the post-approval process, not a manager inbox impact follow-up."""
     lowered = text.lower()
     if re.search(r"\bafter a manager approves\b", lowered):
+        return False
+    # "What happens if I approve/reject it?" is operational impact for pending approvals.
+    if approval_inbox_followup_focus(lowered) in {
+        "approve_impact",
+        "reject_impact",
+        "prepare_approve",
+        "why_urgent",
+        "urgency",
+    }:
+        return False
+    if re.search(r"\b(if i approve|if we approve|approve it|approve that|approve this)\b", lowered):
+        return False
+    if re.search(r"\b(if i reject|if we reject|reject it|reject that|reject this)\b", lowered):
         return False
     return bool(re.search(r"\b(what happens|what would happen|what if)\b", lowered) and re.search(r"\bapprov", lowered))
 
@@ -261,6 +276,449 @@ def manager_team_roster_question(text: str) -> bool:
     return False
 
 
+def hr_corrective_action_question(text: str) -> bool:
+    """True for HR follow-ups asking what corrective actions/steps to take."""
+    return org_transfer_followup_focus(text) == "remediation" or bool(
+        re.search(
+            r"\b("
+            r"what corrective actions?|"
+            r"corrective actions?(?: should| for| to)?|"
+            r"what (?:actions?|steps?) should hr|"
+            r"what should hr (?:do|take|correct|fix|resolve)|"
+            r"recommended (?:hr )?(?:actions?|corrections?|steps?)"
+            r")\b",
+            (text or "").lower(),
+        )
+    )
+
+
+def record_consistency_question(text: str) -> bool:
+    """True when asking whether department / manager / approval-manager records align."""
+    lowered = (text or "").lower()
+    return bool(
+        re.search(
+            r"\b("
+            r"(?:department|reporting[-\s]?manager|approval[-\s]?manager|manager(?:\s+records?)?)"
+            r".{0,80}(?:consistent|consistency|inconsist\w*|mismatch|aligned|match)|"
+            r"(?:consistent|consistency|inconsist\w*|mismatch|aligned|match)"
+            r".{0,80}(?:department|reporting[-\s]?manager|approval[-\s]?manager|manager|records?)"
+            r")\b",
+            lowered,
+        )
+    )
+
+
+def routing_discrepancy_question(text: str) -> bool:
+    """True for employee-record routing / transfer mismatch investigations.
+
+    Plain identity asks such as "who is my reporting manager" are employee_profile,
+    not discrepancy investigations.
+    """
+    lowered = (text or "").lower()
+    if record_consistency_question(lowered):
+        return True
+    # Identity-only reporting-manager questions are not discrepancy probes.
+    if re.search(
+        r"\b(who is my|who's my|who is listed as my|what is my|tell me my)\b.{0,40}\b"
+        r"(reporting[-\s]?manager|line manager|manager)\b",
+        lowered,
+    ) and not re.search(
+        r"\b(inconsist\w*|mismatch|discrepan\w*|previous|old|stale|wrong|transfer|changed)\b",
+        lowered,
+    ):
+        return False
+    return bool(
+        re.search(
+            r"\b("
+            r"routing (?:mismatch|discrepan\w*|inconsist\w*|audit)|"
+            r"approval[-\s]?ownership|stale (?:approval|routing|manager)|"
+            r"previous manager|old manager|approval still|"
+            r"manager_id|approval_manager_id|transfer_effective_date|"
+            r"changed departments?|department transfer|transferred|"
+            r"people-?manager changed|"
+            r"(?:reporting[-\s]?manager|approval[-\s]?manager).{0,40}"
+            r"(?:mismatch|inconsist\w*|discrepan\w*|wrong|stale|changed)|"
+            r"(?:mismatch|inconsist\w*|discrepan\w*|wrong|stale|changed).{0,40}"
+            r"(?:reporting[-\s]?manager|approval[-\s]?manager)|"
+            r"employee[-\s]?record (?:investigation|discrepan\w*|mismatch)|"
+            r"discrepan\w* (?:in|with|between).{0,40}(?:department|manager|approval|routing|record)"
+            r")\b",
+            lowered,
+        )
+    )
+
+
+def org_transfer_followup_focus(message: str) -> str | None:
+    """Follow-up focus for an existing routing_audit / routing_investigation thread.
+
+    Standalone urgency phrasing alone is not enough — that belongs to manager approval
+    inbox threads unless the ask also names a discrepancy/routing/transfer issue.
+    """
+    text = (message or "").lower().strip()
+    discrepancy_cue = bool(
+        re.search(
+            r"\b(discrepan\w*|routing|transfer|previous manager|approval_manager|"
+            r"wrong manager|stale approval|employee record)\b",
+            text,
+        )
+    )
+    if re.search(
+        r"\b(which discrepancy|priority case|worst case|should (?:we|hr) (?:fix|address) first|"
+        r"highest priority (?:discrepan\w*|case|routing)|most urgent (?:discrepan\w*|case|routing))\b",
+        text,
+    ) or (
+        discrepancy_cue
+        and re.search(r"\b(most urgent|highest priority|urgent(?:ly)?)\b", text)
+    ):
+        return "urgency"
+    if re.search(
+        r"\b(why (?:is|was) it important|why (?:does|do) it matter|why (?:should|must) .{0,20}resolve|"
+        r"why important|importance|risk if unresolved|what happens if .{0,20}not (?:fix|correct|resolve))\b",
+        text,
+    ) or (
+        discrepancy_cue
+        and re.search(r"\b(why (?:is|was) it (?:important|urgent)|importance)\b", text)
+    ):
+        return "importance"
+    if re.search(
+        r"\b("
+        r"what steps|how (?:should|can|do) hr (?:correct|fix|resolve)|"
+        r"correct(?:ive)? (?:steps?|actions?)|"
+        r"what corrective actions?|"
+        r"what (?:actions?|steps?) should hr|"
+        r"what should hr (?:do|take|correct|fix|resolve)|"
+        r"actions? (?:should|would|can|must) hr|"
+        r"recommended (?:hr )?(?:actions?|corrections?|steps?)|"
+        r"how to (?:fix|correct|resolve)|remediat\w*"
+        r")\b",
+        text,
+    ):
+        return "remediation"
+    if re.search(r"\b(file|submit|apply|prepare).{0,40}(correction|fix|routing)\b", text) or re.search(
+        r"\b(correct (?:the|this|that) (?:record|routing|approval)|update approval_manager_id)\b",
+        text,
+    ):
+        return "file_correction"
+    return None
+
+
+def approval_inbox_followup_focus(message: str) -> str | None:
+    """Follow-up focus inside a manager pending-approval / team leave-request thread."""
+    text = (message or "").lower().strip()
+    # Routing-discrepancy urgency/importance stays on org_transfer, not the approval inbox.
+    if re.search(
+        r"\b(discrepan\w*|routing|transfer|previous manager|approval_manager|"
+        r"wrong manager|stale approval|employee record)\b",
+        text,
+    ):
+        return None
+    if re.search(
+        r"\b(what happens if (?:i |we )?reject|"
+        r"if i reject|impact of reject|consequences? of reject|"
+        r"what (?:would|will) happen if .{0,20}reject|"
+        r"what if (?:i |we )?reject)\b",
+        text,
+    ):
+        return "reject_impact"
+    if re.search(
+        r"\b(what happens if (?:i |we )?approve|"
+        r"if i approve|impact of approv|consequences? of approv|"
+        r"what (?:would|will) happen if .{0,20}approv|"
+        r"what if (?:i |we )?approve)\b",
+        text,
+    ):
+        return "approve_impact"
+    if re.search(
+        r"\b(prepare (?:the |this |that )?(?:approval|decision)|"
+        r"prepare (?:to )?approv|draft (?:the |this )?approval|"
+        r"wait for my confirmation|await(?:ing)? my confirmation)\b",
+        text,
+    ):
+        return "prepare_approve"
+    if re.search(
+        r"\b(why (?:is|was) (?:it|that|this)(?: request)? urgent|why urgent|"
+        r"why (?:is|was) (?:it|that|this) (?:the )?(?:most )?urgent|"
+        r"what makes (?:it|that|this) urgent)\b",
+        text,
+    ):
+        return "why_urgent"
+    if re.search(
+        r"\b(which (?:request|approval|one) (?:is |has )?(?:the )?(?:most )?urgent|"
+        r"most urgent (?:request|approval|leave)|"
+        r"highest (?:operational )?risk|which (?:request|approval|one) has the highest)\b",
+        text,
+    ):
+        return "urgency"
+    if re.search(r"\b(most urgent|urgent(?:ly)?)\b", text) and re.search(
+        r"\b(request|approval|pending|leave|inbox)\b",
+        text,
+    ):
+        return "urgency"
+    return None
+
+
+def explicit_routing_correction_request(text: str) -> bool:
+    """True only when the user explicitly asks to file/apply a routing correction."""
+    return org_transfer_followup_focus(text) == "file_correction" or bool(
+        re.search(
+            r"\b(file (?:the |this |an? )?(?:hr )?correction|apply (?:the |this )?correction|"
+            r"submit (?:the |a )?routing correction|correct (?:liam|the employee)(?:'s)? (?:routing|record)|"
+            r"update approval_manager_id|please (?:file|apply) .{0,20}correction)\b",
+            (text or "").lower(),
+        )
+    )
+
+
+def team_leave_overlap_question(text: str) -> bool:
+    """True for manager/HR questions about employees with overlapping leave dates."""
+    lowered = (text or "").lower()
+    if re.search(
+        r"\b(organization|organisation|company-wide|across (?:the )?departments?|"
+        r"absenteeism|unplanned absence|attendance patterns?)\b",
+        lowered,
+    ):
+        return False
+    return bool(
+        re.search(
+            r"\b("
+            r"overlap(?:ping)? leave(?: dates?)?|"
+            r"leave(?: dates?)? overlap|"
+            r"employees? (?:have |with )?overlap(?:ping)? leave|"
+            r"which employees .{0,40}overlap|"
+            r"overlapping (?:leave )?(?:dates?|requests?|windows?)|"
+            r"leave conflicts?|"
+            r"same (?:leave )?dates?"
+            r")\b",
+            lowered,
+        )
+        or (
+            re.search(r"\b(overlap|overlapping)\b", lowered)
+            and re.search(r"\b(leave|request|dates?)\b", lowered)
+            and not re.search(r"\b(my present|my attendance|present days?)\b", lowered)
+        )
+    )
+
+
+def workforce_followup_question(text: str) -> bool:
+    """True when the ask needs ranked/absence analytics, not a raw last-N-days attendance dump."""
+    lowered = (text or "").lower()
+    # Employee-record routing investigations are not attendance analytics.
+    if routing_discrepancy_question(lowered):
+        return False
+    # Team leave-overlap questions are staffing analysis, not org absence analytics.
+    if team_leave_overlap_question(lowered):
+        return False
+    return bool(
+        re.search(
+            r"\b("
+            r"highest (?:unplanned )?(?:absence|absenteeism|absent)|"
+            r"which department .{0,60}(?:highest|most|worst).{0,40}(?:absence|absenteeism|absent)|"
+            r"department .{0,40}(?:highest|most).{0,30}(?:absence|absenteeism)|"
+            r"absenteeism|"
+            r"operational consequences?|possible consequences?|consequences? for (?:the )?(?:business|operations|org|organization|organisation)|"
+            r"what (?:are|could be|might be) the .{0,30}consequences|"
+            r"investigat\w*|which employees|which records|employees? or records|"
+            r"should hr (?:investigate|review|look|examine)|"
+            r"records? should hr|"
+            r"absence rates?|unplanned absence|"
+            r"unusual|anomal(?:y|ies)|attendance patterns?"
+            r")\b",
+            lowered,
+        )
+    )
+
+
+def workforce_analytics_focus(message: str, *, prior_focus: str = "", subject: str = "") -> str:
+    """Map an HR analytics question onto a distinct narrate focus."""
+    text = (message or "").lower()
+    if re.search(r"\b(break(?:\s+it)?\s+down|by department)\b", text) and not re.search(
+        r"\b(highest|absenteeism|investigat)\b", text
+    ):
+        return "department_breakdown"
+    if re.search(r"\b(remaining leave|highest remaining|leave balances?)\b", text):
+        return "remaining_balances"
+    if re.search(r"\b(data integrity|integrity issues?|these calculations)\b", text):
+        return "data_integrity"
+    if re.search(r"\b(confidently report|which figures|can hr)\b", text):
+        return "reporting_confidence"
+    if re.search(
+        r"\b(compare|comparison|contrast).{0,40}\b(last|past|previous).{0,20}\bmonths?\b|"
+        r"\b(last|past|previous)\s+(?:\w+\s+)?months?\b.{0,20}\b(compar|contrast)",
+        text,
+    ) or (
+        re.search(r"\b(compare|comparison|contrast)\b", text)
+        and re.search(r"\b(last|past|previous)\s+(?:\w+\s+)?(?:complete\s+)?(?:calendar\s+)?months?\b", text)
+    ) or re.search(
+        r"\b(last|past|previous)\s+(?:two|2)\s+(?:complete\s+)?(?:calendar\s+)?months?\b",
+        text,
+    ):
+        return "month_comparison"
+    if re.search(
+        r"\b(office|location|site).{0,40}\b(increase|change|rose|largest)|"
+        r"\blargest increase\b",
+        text,
+    ):
+        if prior_focus in {
+            "month_comparison",
+            "office_comparison",
+            "absence",
+            "highest_department",
+            "anomaly",
+            "investigation",
+            "recommendations",
+            "consequences",
+            "evidence",
+            "department_breakdown",
+            "",
+        } or subject in {"workforce_analytics", "org_attendance"}:
+            return "office_comparison"
+        return "office_clarification"
+    if re.search(r"\b(unusual|anomal(?:y|ies)|attendance patterns?)\b", text):
+        return "anomaly"
+    if re.search(
+        r"\b(investigat\w*|which employees|which records|employees? or records|"
+        r"should hr (?:investigate|review|look|examine)|records? should hr|"
+        r"further investigation|might need)\b",
+        text,
+    ):
+        return "investigation"
+    if re.search(
+        r"\b(explain the data|data behind|figures? behind|supporting (?:data|figures|evidence))\b",
+        text,
+    ):
+        return "evidence"
+    if re.search(
+        r"\b(operational consequences?|possible consequences?|"
+        r"consequences? for (?:the )?(?:business|operations|org|organization|organisation)|"
+        r"what (?:are|could be|might be) the .{0,30}consequences)\b",
+        text,
+    ):
+        return "consequences"
+    if re.search(r"\b(recommend|recommendation|actions? (?:for|to) hr|what actions)\b", text):
+        return "recommendations"
+    if re.search(
+        r"\b(highest (?:unplanned )?(?:absence|absenteeism|absent)|"
+        r"which department .{0,60}(?:highest|most|worst).{0,40}(?:absence|absenteeism|absent)|"
+        r"department .{0,40}(?:highest|most).{0,30}(?:absence|absenteeism)|"
+        r"absenteeism)\b",
+        text,
+    ):
+        return "highest_department"
+    if "utilization" in text or prior_focus in {
+        "leave_utilization",
+        "department_breakdown",
+        "remaining_balances",
+        "data_integrity",
+        "reporting_confidence",
+    }:
+        return "leave_utilization"
+    return "absence"
+
+
+def personal_leave_status_question(text: str) -> bool:
+    """Employee self-service leave status / pending list — never a manager approval inbox.
+
+    Matches personal phrasing such as "my pending leave" and also role-gated paraphrases
+    like "leave requests awaiting approval" when there is no team/inbox cue.
+    """
+    lowered = (text or "").lower()
+    # Preparing / submitting a leave request is leave_request, not status lookup.
+    if _explicit_leave_request(lowered):
+        return False
+    if re.search(
+        r"\b(my team|direct reports?|team(?:'s)? pending|approval inbox|"
+        r"awaiting my (?:approval|decision)|waiting for my (?:approval|decision)|"
+        r"my (?:pending )?approvals?|sign[- ]?off|waiting (?:on|for) me|"
+        r"from me|needs? my (?:decision|approval)|sitting with me|"
+        r"across (?:the )?(?:organization|organisation|company)|organization-wide|"
+        r"organisation-wide|company-wide|all employees)\b",
+        lowered,
+    ):
+        return False
+    if re.search(_TEAM_CUE, lowered):
+        return False
+    # Explicit personal leave status / pending list.
+    if re.search(
+        r"\b("
+        r"(?:show|list|display|see|get)\s+(?:me\s+)?(?:my\s+)?pending\s+leave(?:\s+requests?)?|"
+        r"my\s+pending\s+leave(?:\s+requests?)?|"
+        r"status\s+of\s+my\s+leave|"
+        r"what(?:'s| is)\s+the\s+status\s+of\s+my\s+leave|"
+        r"my\s+leave\s+requests?(?:\s+status)?|"
+        r"leave\s+request\s+status|"
+        r"how\s+many\s+(?:of\s+)?my\s+leaves?\s+(?:are\s+)?pending|"
+        r"what\s+leave\s+requests?\s+(?:are\s+)?awaiting\s+approval|"
+        r"leave\s+requests?\s+(?:that\s+are\s+)?(?:pending|awaiting\s+approval|waiting\s+for\s+(?:a\s+)?(?:decision|approval))"
+        r")\b",
+        lowered,
+    ):
+        return True
+    # Bare pending-leave asks without team/approver framing (role-gated in classify for employees).
+    if re.search(r"\bpending\s+leave(?:\s+requests?)?\b", lowered) and not re.search(
+        r"\b(team|reports?|approvals?|inbox|sign[- ]?off)\b",
+        lowered,
+    ):
+        return True
+    return False
+
+
+def approval_inbox_question(text: str) -> bool:
+    """Manager approval-inbox asks (list / waiting / highest risk), not approve/reject decisions."""
+    lowered = text.lower()
+    # Explicit decide phrasing is handled by parse_approval_decision instead.
+    if re.search(r"\b(approve|reject)\s+(?:leave\s+)?(?:request\s+)?#?\d+\b", lowered):
+        return False
+    if re.search(r"\b(approve|reject)\s+(?:it|that|this|the request|that request|this request)\b", lowered):
+        return False
+    # Preparing an approval decision is approval_decision, not a fresh inbox list.
+    if approval_inbox_followup_focus(lowered) == "prepare_approve":
+        return False
+    # An employee's own pending leave / leave status is never the manager inbox.
+    if personal_leave_status_question(lowered) and not re.search(
+        r"\b(my team|direct reports?|awaiting my|waiting for my|approval inbox|"
+        r"my (?:pending )?approvals?|sign[- ]?off|from me)\b",
+        lowered,
+    ):
+        return False
+    if re.search(
+        r"\b("
+        r"pending approvals?|my (?:pending )?approvals?|approval inbox|"
+        r"awaiting my (?:approval|decision)|waiting for my (?:approval|decision)|"
+        r"waiting on (?:a |my )?(?:decision|approval|sign[- ]?off) from me|"
+        r"requests? (?:are )?waiting for (?:my|me)|waiting for me|"
+        r"which requests? (?:are )?waiting|"
+        r"which (?:request|approval|one) has the highest (?:operational )?risk|"
+        r"highest (?:operational )?risk\b.{0,40}\b(?:request|approval|pending)|"
+        r"(?:request|approval|pending).{0,40}\bhighest (?:operational )?risk|"
+        r"which (?:request|approval|one) (?:is |has )?(?:the )?(?:most )?urgent|"
+        r"most urgent (?:request|approval|leave)|"
+        r"needs? my sign[- ]?off|still needs? my (?:decision|approval|sign[- ]?off)|"
+        r"sitting in my inbox|in my inbox waiting|"
+        r"(?:leave|approval) (?:asks?|requests?) (?:are )?(?:sitting )?in (?:my )?inbox|"
+        r"(?:leave asks?|leave requests?|approvals?).{0,40}\b(?:inbox|sign[- ]?off|waiting on)|"
+        r"(?:my |the )?team(?:'s)? pending (?:leave )?requests?|"
+        r"pending leave requests? (?:for|on|in) (?:my |the )?(?:team|direct reports?)|"
+        r"show (?:me )?(?:my |the )?team(?:'s)? .{0,40}pending"
+        r")\b",
+        lowered,
+    ):
+        return True
+    # Team-scoped pending leave listing (not the manager's own leave history).
+    if re.search(r"\b(my team|direct reports?|team(?:'s)?)\b", lowered) and re.search(
+        r"\b(pending (?:leave )?requests?|leave requests? (?:that are )?pending|awaiting (?:my )?approval)\b",
+        lowered,
+    ):
+        return True
+    # Paraphrases: leave/approvals + inbox / sign-off / waiting on me.
+    if re.search(r"\b(leave|approval|approvals?|requests?|asks?)\b", lowered) and re.search(
+        r"\b(inbox|sign[- ]?off|waiting (?:on|for) (?:a )?(?:decision|approval) from me|"
+        r"needs? (?:my|a) (?:decision|approval|sign[- ]?off))\b",
+        lowered,
+    ):
+        return True
+    return False
+
+
 def parse_approval_decision(message: str) -> dict | None:
     """Extract an approve/reject decision aimed at a leave/approval request.
 
@@ -268,8 +726,33 @@ def parse_approval_decision(message: str) -> dict | None:
     or "that request"; the workflow resolves the id from conversation state.
     """
     text = message.lower().strip()
+    # Informational asks about who must approve / what is required are not decisions.
+    if re.search(
+        r"\b(who (?:needs to|must|will|should|would|can|could) approve|who approves|"
+        r"tell me who (?:would|will|needs? to|must|should) approve|"
+        r"approval (?:path|chain|requirements?)|"
+        r"what (?:do i|must i|needs? to be).{0,40}(?:before|submit|approv)|"
+        r"what happens if .{0,40}\b(?:approve|reject)|"
+        r"needs? to approve|required (?:to )?approv)\b",
+        text,
+    ):
+        return None
+    # Employee drafting their own leave ("draft/prepare … so I can confirm") is never an
+    # approval decision, even when the sentence also asks who would approve it.
+    # Preparing "the approval" / waiting for confirmation is a manager approval decision.
+    if re.search(r"\b(draft|prepare)\b", text) and re.search(
+        r"\b(leave|request|application|so i can confirm|for me to confirm)\b", text
+    ) and not re.search(r"\b(the approval|this approval|that approval|approval decision)\b", text):
+        return None
     decision = None
-    if re.search(r"\bapprove\b", text) and not re.search(r"\breject\b", text):
+    if re.search(
+        r"\b(prepare (?:the |this |that )?(?:approval|decision)|"
+        r"prepare (?:to )?approv|draft (?:the |this )?approval|"
+        r"wait for my confirmation|await(?:ing)? my confirmation)\b",
+        text,
+    ) and not re.search(r"\breject\b", text):
+        decision = "approve"
+    elif re.search(r"\bapprove\b", text) and not re.search(r"\breject\b", text):
         decision = "approve"
     elif re.search(r"\breject\b", text):
         decision = "reject"
@@ -296,9 +779,14 @@ def parse_approval_decision(message: str) -> dict | None:
             "reason": reason,
         }
     # Pronoun / prior-request follow-up: "Reject it because coverage is insufficient."
-    if re.search(r"\b(request|approval|leave request)\b", text) or re.search(
-        r"\b(?:approve|reject)\s+(?:it|that|this|the request|that request|this request)\b",
-        text,
+    # Also covers "Prepare the approval and wait for my confirmation."
+    if (
+        re.search(r"\b(request|approval|leave request|confirmation)\b", text)
+        or re.search(
+            r"\b(?:approve|reject)\s+(?:it|that|this|the request|that request|this request)\b",
+            text,
+        )
+        or re.search(r"\b(prepare|draft).{0,30}\bapprov", text)
     ):
         return {
             "decision": decision,
@@ -318,7 +806,8 @@ def manager_team_ops_question(text: str) -> bool:
     scope_text = re.sub(r"\b(organi[sz]ation)(?:'s)?\s+(date|day|today|calendar)\b", "reference \\2", lowered)
     if re.search(
         r"\b(organization|organisation|organization-wide|organisation-wide|company-wide|"
-        r"all employees|every employee|entire company|across (the )?organization)\b",
+        r"all employees|every employee|entire company|across (the )?organization|"
+        r"across (?:all )?departments?|every department|all departments)\b",
         scope_text,
     ):
         return False
@@ -328,7 +817,8 @@ def manager_team_ops_question(text: str) -> bool:
         re.search(
             r"\b(my team|my (?:direct |(?!attendance |leave |expense |status |hr |holiday |remote |absence )\w+ )?reports?|"
             r"direct reports?|team members?|members of my team|awaiting my approval|"
-            r"waiting for my (approval|decision)|report(?:s|ing)? to me|a report'?s|one of my reports|my people|"
+            r"waiting for my (approval|decision)|pending approvals?|my (?:pending )?approvals?|"
+            r"report(?:s|ing)? to me|a report'?s|one of my reports|my people|"
             r"my reporting line|(?:in|on) my (?:reporting )?line|under me|"
             r"(?:for|across|within|on) (?:the |my )?team|team(?:'s)? (?:risk|attendance|leave|coverage|late|absences?)|"
             r"(?:two|three|four|five|several|some|both|any|a few|most|all|each|every|which|no) (?:of my )?reports(?: are| have| show| were| is)?|"
@@ -348,6 +838,7 @@ def manager_team_ops_question(text: str) -> bool:
             r"attendance overview|attendance anomal|"
             r"anomal(?:y|ies)|data quality|currently on leave|who is on leave|on leave|pending leave|"
             r"approved (?:leave|requests?)|awaiting my approval|waiting for my (approval|decision)|"
+            r"pending approvals?|my (?:pending )?approvals?|approval inbox|highest (?:operational )?risk|"
             r"sitting with me|lowest remaining|highest remaining|leave balances?|remaining balances?|"
             r"remaining (?:annual )?leave|annual leave remaining|remaining days|used all|"
             r"at or below|or fewer|or less|less than \w+ days?|below \w+ days?|"
@@ -387,7 +878,10 @@ def manager_team_ops_question(text: str) -> bool:
             r"\b(employees with repeated late|employees with incomplete attendance|"
             r"which (?:of my )?reports|which of my reports|my reports show|among my reports|"
             r"anyone on my team|any of my (?:reports|people|direct reports)|"
-            r"which employees have (?:pending leave|attendance patterns|missing profile|incomplete)|"
+            r"which employees have (?:(?:unusual|anomalous|odd|strange)\s+)?"
+            r"(?:pending leave|attendance patterns?|missing profile|incomplete)|"
+            r"employees? (?:with|showing|who have) (?:(?:unusual|anomalous)\s+)?attendance|"
+            r"unusual attendance(?: patterns?)?|anomalous attendance|attendance anomal(?:y|ies)|"
             r"employees with the lowest remaining|who is currently on leave|"
             r"are any employees currently on leave|employees currently on leave|"
             r"who has exhausted|exhausted their annual leave|has anyone on my team exhausted|"
@@ -399,7 +893,25 @@ def manager_team_ops_question(text: str) -> bool:
             lowered,
         )
     )
-    return bool(ops and (team_cue or ambiguous_teamish or re.search(r"\bawaiting my approval\b", lowered)))
+    # Unusual/anomalous attendance without explicit org markers is team-scoped for managers.
+    unusual_attendance = bool(
+        re.search(
+            r"\b(unusual|anomal(?:y|ies)|anomalous)\b.{0,40}\battendance\b|"
+            r"\battendance\b.{0,40}\b(unusual|anomal(?:y|ies)|anomalous|patterns?)\b",
+            lowered,
+        )
+    )
+    return bool(
+        unusual_attendance
+        or (
+            ops
+            and (
+                team_cue
+                or ambiguous_teamish
+                or re.search(r"\bawaiting my approval\b", lowered)
+            )
+        )
+    )
 
 
 def self_scoped_approved_without_decision(text: str) -> bool:
@@ -751,11 +1263,145 @@ def data_semantics_question(text: str) -> bool:
     )
 
 
+def leave_date_recommendation_question(text: str) -> bool:
+    """Employee asking which leave dates fit balance / coverage / policy — not submitting leave."""
+    lowered = (text or "").lower()
+    if re.search(
+        r"\b(submit|file|book|apply for|create|prepare).{0,20}\b(leave|request)\b|"
+        r"\b(approve|reject)\b",
+        lowered,
+    ):
+        return False
+    return bool(
+        re.search(
+            r"\b("
+            r"which dates? (?:would be |are )?(?:best|better|good|suitable|recommended)|"
+            r"best (?:dates?|window|time) (?:for|to) (?:my )?leave|"
+            r"recommend(?:ed)? (?:leave )?dates?|"
+            r"suggest(?:ed)? (?:leave )?dates?|"
+            r"when (?:should|can|could) i (?:take|book|request) leave|"
+            r"dates? .{0,40}(?:balance|coverage)|"
+            r"(?:balance|coverage).{0,40}dates?"
+            r")\b",
+            lowered,
+        )
+        and re.search(r"\b(leave|vacation|time off|annual)\b", lowered)
+    )
+
+
+def delayed_approval_advice_question(text: str) -> bool:
+    """Employee advice about a leave request waiting on manager/HR — not a new leave draft."""
+    lowered = (text or "").lower()
+    # New leave drafting / HITL submission is never delayed-approval guidance.
+    if re.search(
+        r"\b("
+        r"(?:prepare|draft|submit|file|book|create).{0,40}\b(?:leave|request)\b|"
+        r"approve leave request|reject leave request|"
+        r"i want to (?:apply|request|take)|apply for leave next|"
+        r"plan(?:ning)? (?:to take )?leave"
+        r")\b",
+        lowered,
+    ) and not re.search(
+        r"\b(has not approved|hasn'?t approved|still (?:awaiting|pending|waiting)|"
+        r"doesn'?t respond|did not respond|no response|delayed)\b",
+        lowered,
+    ):
+        return False
+    waiting = bool(
+        re.search(
+            r"\b("
+            r"manager has not approved|has(?:n'?t| not) (?:been )?approved|"
+            r"still (?:waiting|pending|awaiting)|waiting (?:for|on) (?:my )?(?:manager|approval|decision)|"
+            r"still awaiting approval|awaiting approval|"
+            r"not (?:yet )?approved|no (?:decision|approval) yet|"
+            r"manager (?:has )?not (?:responded|replied|decided)|"
+            r"manager doesn'?t respond|manager did not respond|if (?:my )?manager doesn'?t respond|"
+            r"pending for (?:several |a few |\d+ )?days|"
+            r"(?:my )?leave (?:has )?been pending|leave request still|"
+            r"approval (?:is|has been) delayed|delayed approval|"
+            r"why .{0,40}(?:still )?(?:pending|awaiting|waiting)"
+            r")\b",
+            lowered,
+        )
+    )
+    advice = bool(
+        re.search(
+            r"\b(what should i do|what can i do|what do i do|can you advise|advise|next steps?|"
+            r"how (?:long|should)|follow up|escalate|who (?:can|should|needs? to) (?:i )?(?:ask|contact|approve)|"
+            r"who needs to approve|why is|what if)\b",
+            lowered,
+        )
+    )
+    # Pending-leave approver identity is guidance about an existing request.
+    if re.search(r"\bwho needs to approve\b", lowered) and re.search(
+        r"\b(pending leave|my (?:pending )?leave|leave request|it)\b",
+        lowered,
+    ):
+        return True
+    # Short follow-ups about an already-pending request.
+    if re.search(
+        r"\b(how long has it been pending|what if they still don'?t respond|"
+        r"can i follow up with my manager|follow up with my manager)\b",
+        lowered,
+    ):
+        return True
+    return waiting and (advice or re.search(r"\b(leave|request|manager|pending)\b", lowered))
+
+
 def rule_intent(message: str, *, mentioned_other: bool, kinds: set[str], bulk: bool) -> str | None:
     text = message.lower()
     team_cue = bool(re.search(_TEAM_CUE, text))
     if manager_team_roster_question(text):
         return "team_roster"
+    # Advice about delayed manager approval before leave-status "approved/rejected" steals.
+    if delayed_approval_advice_question(text):
+        return "leave_request_status"
+    # Best-date recommendations are leave planning guidance, not leave-request creation.
+    if leave_date_recommendation_question(text):
+        return "leave_planning"
+    # Employee self-service pending/status leave before manager approval-inbox heuristics.
+    if personal_leave_status_question(text):
+        return "leave_request_status"
+    # Approval inbox listing/risk ranking must beat overlap/conflict heuristics and LLM fallback.
+    if approval_inbox_question(text):
+        return "team_analytics"
+    inbox_follow = approval_inbox_followup_focus(text)
+    # Preparing an inherited pending approval beats leave-draft / org-transfer heuristics.
+    if inbox_follow == "prepare_approve" or (
+        re.search(r"\b(prepare|draft)\b", text)
+        and re.search(r"\b(approval|approve)\b", text)
+        and re.search(r"\b(confirm|confirmation|wait)\b", text)
+    ):
+        return "approval_decision"
+    # Urgency / why-urgent / approve|reject-impact are team pending-approval analytics, not policy.
+    if inbox_follow in {"urgency", "why_urgent", "approve_impact", "reject_impact"}:
+        return "team_analytics"
+    # Employee-record routing / transfer mismatches before attendance analytics or directory.
+    if routing_discrepancy_question(text):
+        return "org_transfer"
+    # Urgency / importance / remediation ONLY when the ask is clearly a routing discrepancy
+    # follow-up. Plain "most urgent / why urgent" belongs to approval-inbox threads.
+    # Corrective-action phrasing is remediation for routing investigations (HR Admin).
+    if hr_corrective_action_question(text) or org_transfer_followup_focus(text) is not None:
+        return "org_transfer"
+    # Manager/HR leave-overlap staffing questions before workforce "which employees" steal.
+    if team_leave_overlap_question(text):
+        return "team_conflict"
+    # Absenteeism ranking / consequences / investigation must beat directory and last-7-day dumps.
+    # Keep month-over-month "which department contributed most?" on org_attendance comparison threads.
+    if (
+        workforce_followup_question(text)
+        and not re.search(r"\b(my team|direct reports?|my reports?)\b", text)
+        and not re.search(r"\bcontributed most\b", text)
+    ):
+        return "workforce_analytics"
+    # Overtime premium / extra-pay policy (including conflicting rate docs) before salary analytics.
+    if re.search(
+        r"\b(overtime|extra pay|premium(?:\s+rate)?|work past (?:the )?(?:usual )?weekly hours|"
+        r"hours (?:per week|beyond|over))\b",
+        text,
+    ) and not re.search(r"\b(calculate|compute|incomplete|missing rate)\b", text):
+        return "policy_question"
     if re.search(r"\b(how many projects|projects? (?:are )?registered|expired polic(?:y|ies))\b", text):
         return "hr_metrics"
     if not mentioned_other and not bulk and data_semantics_question(text):
@@ -1083,9 +1729,21 @@ def rule_intent(message: str, *, mentioned_other: bool, kinds: set[str], bulk: b
     ) or (
         re.search(r"\b(my team|members of my team|direct reports?)\b", text)
         and re.search(r"\b(overlap|overlapping|conflict|staffing|same week|project delivery|coverage)\b", text)
+        # Employees asking whether *their own* planned leave affects team coverage stay on leave planning.
+        # Manager/HR team-conflict analysis is for reviewing other people's overlapping requests.
+        and not re.search(
+            r"\b(would (?:that|this|my leave|taking)|affect (?:my )?team|enough coverage|"
+            r"team(?:'s)? coverage|if i take|my (?:leave|absence|time off))\b",
+            text,
+        )
     ) or (
         re.search(r"\b(overlap|overlapping)\b", text)
         and re.search(r"\b(leave|absence|absences|requests?)\b", text)
+        and not re.search(
+            r"\b(would (?:that|this|my leave|taking)|affect (?:my )?team|enough coverage|"
+            r"team(?:'s)? coverage|if i take|my (?:leave|absence|time off))\b",
+            text,
+        )
     ):
         return "team_conflict"
     attendance = bool(re.search(r"\b(attendance|attended|attend|absent|late|present)\b", text))
@@ -1105,7 +1763,18 @@ def rule_intent(message: str, *, mentioned_other: bool, kinds: set[str], bulk: b
         return "attendance_query"
     if attendance and "policy" not in text and (_personal(text) or "record" in text or mentioned_other):
         return "attendance_query"
-    if re.search(r"\bholidays?\b", text) and "policy" not in text:
+    # Advance-notice / rulebook policy beats holiday calendar and leave-status heuristics.
+    if re.search(r"\b(advance notice|notice period|how (?:much|many).{0,40}notice|days of (?:advance )?notice)\b", text) or (
+        re.search(r"\bnotice\b", text)
+        and re.search(r"\b(leave|annual|vacation|pto|time off|rulebook|policy|policies|handbook|expect|required|require)\b", text)
+        and not re.search(r"\bresign", text)
+    ):
+        return "leave_policy"
+    if re.search(r"\b(rulebook|leave policy|annual leave policy|handbook)\b", text) and re.search(
+        r"\b(notice|advance|how many|how much|entitled|business days)\b", text
+    ):
+        return "leave_policy"
+    if re.search(r"\bholidays?\b", text) and "policy" not in text and not re.search(r"\bnotice\b", text):
         return "holiday_query"
     if re.search(r"\b(modify|reschedule|edit)\b", text) and re.search(r"\bleave\b", text):
         return "leave_request_status"
@@ -1131,6 +1800,9 @@ def rule_intent(message: str, *, mentioned_other: bool, kinds: set[str], bulk: b
             and re.search(r"\b(pending|approved|rejected|cancelled|canceled|status|history|latest|list|ranges?)\b", text)
         )
     ):
+        # Policy / notice questions that mention business days must not become status lookups.
+        if re.search(r"\b(notice|rulebook|policy|policies|handbook|expect|required)\b", text):
+            return "leave_policy"
         if not _explicit_leave_request(text):
             return "leave_request_status"
     if re.search(r"\bwho approved\b", text):
@@ -1159,6 +1831,16 @@ def rule_intent(message: str, *, mentioned_other: bool, kinds: set[str], bulk: b
         r"\b(take|days off|day off|time off)\b", text
     ):
         return "leave_eligibility"
+    # Own-leave coverage / affordability questions are leave planning, not manager team analytics.
+    if re.search(
+        r"\b(team(?:'s)? coverage|enough coverage|affect (?:my )?team|can i afford|"
+        r"afford that with my (?:remaining )?leave)\b",
+        text,
+    ) and (
+        _personal(text)
+        or re.search(r"\b(if i take|my leave|taking|would that|next month|one week|two weeks)\b", text)
+    ):
+        return "leave_planning"
     if (
         re.search(r"\b(enough|sufficient)\b", text)
         and "balance" in text
@@ -1168,7 +1850,19 @@ def rule_intent(message: str, *, mentioned_other: bool, kinds: set[str], bulk: b
         return "leave_eligibility"
     if re.search(r"\b(instead|use annual leave|use sick leave)\b", text):
         return "policy_question"
-    if re.search(r"\b(probation|reset|compensat)\b", text):
+    # Compensation band / policy documents are retrieval, not person-level confidential_lookup.
+    if re.search(
+        r"\b(compensation\s+bands?|pay\s+bands?|salary\s+bands?|compensation\s+(?:policy|policies|notes?|document|handbook)|"
+        r"confidential\s+compensation|compensation\s+band\s+notes?)\b",
+        text,
+    ):
+        return "policy_question"
+    if re.search(r"\b(probation|reset|compensation|compensatory)\b", text) and re.search(
+        r"\b(policy|policies|band|bands|notes?|document|handbook|grade|grades|senior)\b",
+        text,
+    ):
+        return "policy_question"
+    if re.search(r"\b(probation|reset)\b", text):
         return "policy_question"
     if _explicit_leave_request(text):
         return "leave_request"
@@ -1201,24 +1895,17 @@ def rule_intent(message: str, *, mentioned_other: bool, kinds: set[str], bulk: b
         or (re.search(r"\b(used|already used)\b", text) and re.search(r"\b(annual|sick|leave)\b", text))
     ) and not planning_cues:
         return "leave_balance"
-    planning = any(
-        phrase in text
-        for phrase in (
-            "take ",
-            "taking",
-            "planning",
-            "plan leave",
-            "days off",
-            "time off",
-            "two weeks",
-            "book leave",
-            "request leave",
-            "want leave",
-            "would like leave",
-            "like to take leave",
-            "need leave",
-            "apply for leave",
-            "applyfor leave",
+    # Require leave/time-off context so phrases like "take to correct" do not open leave planning.
+    planning = bool(
+        re.search(
+            r"\b("
+            r"take (?:some |a few |one |two |three |\d+ )?(?:days?|weeks?)(?:\s+off)?|"
+            r"taking (?:leave|time off|days? off|vacation)|"
+            r"planning (?:to take |my )?leave|plan leave|days off|time off|two weeks off|"
+            r"book leave|request leave|want leave|would like leave|like to take leave|"
+            r"need leave|apply for leave|applyfor leave"
+            r")\b",
+            text,
         )
     ) and not re.search(r"\b(remain(?:s|ing)?|balance|used|entitled|exhausted)\b", text)
     if planning:
@@ -1281,8 +1968,13 @@ def rule_intent(message: str, *, mentioned_other: bool, kinds: set[str], bulk: b
             return "attendance_query"
         return "policy_question"
     # Bare "annual leave" / "on leave" is not enough to open leave planning when the ask is informational.
-    # "plan leave" / "book leave" / "request leave" are explicit workflow starts.
-    if re.search(r"\b(book|submit|prepare|request|plan|apply(?:\s+for)?)\b", text) and re.search(
+    # Prepare / submit / draft / file are leave_request; exploratory apply/plan stays planning.
+    if re.search(r"\b(book|submit|prepare|draft|file)\b", text) and re.search(
+        r"\b(vacation|annual leave|on leave|leaves?)\b",
+        text,
+    ):
+        return "leave_request"
+    if re.search(r"\b(apply(?:\s+for)?|request|plan)\b", text) and re.search(
         r"\b(vacation|annual leave|on leave|leaves?)\b",
         text,
     ):
@@ -1312,14 +2004,66 @@ def _explicit_leave_request(text: str) -> bool:
     """True when the employee asks to prepare or submit leave, not when they ask about requesting it."""
     # Tolerate missing spaces from chat UI typos: "applyfor leave"
     text = re.sub(r"\bapplyfor\b", "apply for", text)
+    text = re.sub(r"\bprepare\s*&\s*submit\b", "prepare and submit", text)
+    # Delayed / pending approval guidance is status advice, never a new draft.
+    if delayed_approval_advice_question(text):
+        return False
+    # Exploratory apply/plan without prepare/submit/draft stays leave_planning.
+    if re.search(
+        r"\b(next month|planning to|i(?:'m| am) planning|thinking (?:of|about)|considering)\b",
+        text,
+    ) and not re.search(r"\b(prepare|submit|draft|file|confirm)\b", text):
+        return False
     if re.search(r"\b(before|when|while|about)\s+requesting\b", text):
         return False
+    # Informational "who would/needs to approve" must not block a draft/prepare leave ask.
+    info_approve = bool(
+        re.search(
+            r"\b(who (?:would|will|needs? to|must|should) approve|who approves|approval (?:path|chain)|"
+            r"tell me who (?:would|will|needs? to) approve)\b",
+            text,
+        )
+    )
+    leave_context = bool(
+        re.search(r"\b(leave|annual|vacation|time off|day off|days off|request|application)\b", text)
+    )
+    # Draft / prepare / submit cues — allow short intervening duration/type words
+    # ("prepare and submit one day of annual leave", "submit a leave request").
+    draft_prepare = bool(
+        re.search(
+            r"\b("
+            r"prepare(?:\s+and)?\s+submit|"
+            r"draft(?:\s+and)?\s+submit|"
+            r"(?:prepare|draft|submit|file|book|apply for)\s+"
+            r"(?:(?:the|a|an|my|one|two|three|\d+)\s+){0,6}"
+            r"(?:day(?:s)?\s+(?:of\s+)?)?(?:annual\s+|sick\s+)?"
+            r"(?:leave|vacation|time off)(?:\s+request|\s+application)?|"
+            r"(?:prepare|draft|submit|file|book)\s+(?:the\s+|a\s+|an\s+|my\s+)?"
+            r"(?:leave|annual leave|vacation)?\s*(?:request|application)|"
+            r"prepare (?:leave|it|that|this)|"
+            r"draft (?:it|that|this)|"
+            r"so i can confirm|for me to confirm|wait for (?:my )?confirm|"
+            r"i want to request|i'd like to request|i would like to request|"
+            r"i want to submit|i'd like to submit|i would like to submit|"
+            r"book leave|request leave|submit leave|file leave|apply for leave"
+            r")\b",
+            text,
+        )
+    )
+    if draft_prepare and leave_context:
+        return True
     if re.search(
         r"\b(what if|what happens|status|pending|who will|who needs|notice|policy|instead|enough|whether|"
-        r"modify|cancel|approve|approving|eligible|eligibility|another annual|"
+        r"modify|cancel|eligible|eligibility|another annual|"
         r"list|history|date ranges?|business days|how many requests?|show my (?:approved )?leave)\b",
         text,
     ):
+        # Explicit prepare/submit still wins over informational exclude cues.
+        if draft_prepare and leave_context:
+            return True
+        return False
+    # Bare "approve/approving" blocks only when this is not an informational approve-path ask.
+    if not info_approve and re.search(r"\b(approve|approving)\b", text):
         return False
     if re.search(r"\b(do not submit|don't submit|without submitting)\b", text) and re.search(r"\bprepar", text):
         return True
@@ -1327,12 +2071,17 @@ def _explicit_leave_request(text: str) -> bool:
         return True
     if re.search(r"\b(apply for|application for)\b", text) and re.search(r"\bleaves?\b", text):
         return True
+    if re.search(r"\b(submit|prepare|draft|file|book)\b", text) and re.search(
+        r"\b(leave|vacation|time off)\b", text
+    ):
+        return True
     if re.search(r"\brequest\b", text) and re.search(r"\bleave\b", text):
         return True
     return bool(
         re.search(
             r"\b(i want to request|i'd like to request|i would like to request|book leave|request leave|"
-            r"submit leave|file leave|prepare a leave|prepare leave|prepare the request|apply for leave)\b",
+            r"submit leave|file leave|prepare a leave|prepare leave|prepare the request|apply for leave|"
+            r"draft (?:a |the |an )?leave|draft the request)\b",
             text,
         )
     )
@@ -1346,11 +2095,15 @@ def _day_count(token: str) -> int | None:
 
 def parse_business_days(message: str) -> int | None:
     text = message.lower().strip().rstrip(".!")
-    if re.search(r"two weeks|2 weeks", text):
+    if re.search(r"\b(two weeks|2 weeks)\b", text):
         return 10
-    match = re.search(r"(\d+)\s+weeks?", text)
+    if re.search(r"\b(one week|1 week|a week|only one week)\b", text):
+        return 5
+    match = re.search(r"\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+weeks?\b", text)
     if match:
-        return int(match.group(1)) * 5
+        count = _day_count(match.group(1))
+        if count is not None:
+            return count * 5
     match = re.search(r"(\d+)\s+business days", text)
     if match:
         return int(match.group(1))
@@ -1426,6 +2179,10 @@ _SUBJECT_INTENT = {
     "workforce_analytics": "workforce_analytics",
     "team_conflict": "team_conflict",
     "approval_decision": "approval_decision",
+    "approval_inbox": "team_analytics",
+    "routing_audit": "org_transfer",
+    "routing_investigation": "org_transfer",
+    "org_transfer": "org_transfer",
 }
 
 _MONTH_NAME = re.compile(
@@ -1441,19 +2198,38 @@ def leave_plan_followup(message: str, inherited: dict | None) -> tuple[str, str]
     Preserves the planned window for holidays, projects, approvals, draft review,
     confirmation gates, and duration recalculation without expanding authorization.
     """
-    if not inherited or inherited.get("subject") != "leave_plan":
-        return None
-    if not inherited.get("start") or not inherited.get("end"):
+    if not inherited or inherited.get("subject") not in {"leave_plan", "leave_eligibility"}:
         return None
     text = message.lower().strip()
     if re.search(r"\b(weather|joke|recipe|password|credential|salary|compensation)\b", text):
         return None
+    has_window = bool(inherited.get("start") and inherited.get("end"))
+    # Eligibility threads can still change duration or ask coverage/approvals without a stored window yet.
+    if inherited.get("subject") == "leave_plan" and not has_window:
+        return None
+    if re.search(
+        r"\b(team(?:'s)? coverage|enough coverage|affect (?:my )?team|coverage (?:ok|okay|enough)|"
+        r"staffing|understaff)\b",
+        text,
+    ):
+        return "leave_planning", "coverage"
     if re.search(r"\bproject\b", text) and re.search(r"\b(deadline|deadlines|delivery|milestone)\b", text):
         return "leave_planning", "projects"
     if re.search(r"\bholidays?\b", text):
         return "holiday_query", "holidays"
     if re.search(r"\bapprovals?\b", text) and re.search(r"\b(need|would|required|who|path|chain)\b", text):
         return "leave_planning", "approvals"
+    if re.search(
+        r"\b(who (?:needs to|must|will|should) approve|who approves|approval (?:path|chain))\b",
+        text,
+    ):
+        return "leave_planning", "approvals"
+    if re.search(
+        r"\b(what (?:do i |must i )?need|what (?:steps?|needs?) (?:do i need |to be )?(?:done|completed|complete)|"
+        r"before (?:i )?submit|checklist|prerequisites?|ready to submit)\b",
+        text,
+    ):
+        return "leave_planning", "prerequisites"
     if re.search(r"\b(show|review|display|see)\b", text) and re.search(
         r"\b(the )?(request|draft)\b", text
     ):
@@ -1472,9 +2248,9 @@ def leave_plan_followup(message: str, inherited: dict | None) -> tuple[str, str]
         and not re.search(r"\b(notice|policy|carry)\b", text)
     ):
         return "leave_planning", "business_days"
-    if re.search(r"\b(enough leave|enough balance|do i have enough)\b", text):
+    if re.search(r"\b(enough leave|enough balance|do i have enough|can i afford)\b", text):
         return "leave_planning", "balance_check"
-    if re.search(r"\b(those dates|that period|that window|same dates|same period|same window)\b", text):
+    if has_window and re.search(r"\b(those dates|that period|that window|same dates|same period|same window)\b", text):
         return "leave_planning", "window"
     # Duration-only change keeps leave type / identity / start; leave_analysis recomputes end.
     if parse_business_days(text) is not None and re.search(
@@ -1526,7 +2302,11 @@ def continuation_intent(message: str, inherited: dict | None) -> str | None:
             r"\b(discrepanc\w*|reconcil\w*|overlap|missing|approved|sick|balance|same|that|those|it)\b"
         )
     elif subject == "leave_history":
-        signals.append(r"\b(approved|rejected|pending|who|other|status|it|that|request|application)\b")
+        signals.append(
+            r"\b(approved|rejected|pending|who|other|status|it|that|request|application|"
+            r"approver|approval manager|manager|follow up|next steps?|what should i do|"
+            r"how long|still|respond|advise|awaiting|which request)\b"
+        )
     elif subject == "leave_balance":
         signals.append(
             r"\b(used|pending|remaining|include|sick|annual|deduct|responsible|match|"
@@ -1545,9 +2325,11 @@ def continuation_intent(message: str, inherited: dict | None) -> str | None:
         )
     elif subject == "org_attendance":
         signals.append(
-            r"\b(compare|absent|absences|absence rates?|remote|hours|present|september|october|"
-            r"office|location|unusual|anomal|pattern|investigation|recommend|recommendation|"
-            r"explain|data behind|last (?:\w+ )?months?|largest increase|departments?)\b"
+            r"\b(compare|absent|absences|absenteeism|absence rates?|remote|hours|present|september|october|"
+            r"how much|increase|decreased|contributed most|department contributed|"
+            r"office|location|unusual|anomal|pattern|investigat\w*|recommend|recommendation|"
+            r"operational consequences?|consequences?|explain|data behind|"
+            r"last (?:\w+ )?months?|largest increase|departments?|highest|employees?|records?)\b"
         )
     elif subject == "org_leave":
         signals.append(r"\b(how many|which ones|hr approval|sort|sick|annual|balance)\b")
@@ -1561,11 +2343,13 @@ def continuation_intent(message: str, inherited: dict | None) -> str | None:
         signals.append(r"\b(engineering|department|only|average|payroll)\b")
     elif subject == "hr_metrics":
         signals.append(r"\b(compare|month|october|september)\b")
-    elif subject == "team_analytics":
+    elif subject in {"team_analytics", "approval_inbox"}:
         signals.append(
             r"\b(approved|pending|remote(?:ly)?|remote[-\s]?work|those|them|their|incomplete|attendance|leave|"
             r"what about|department|departments?|break(?:\s+\w+)?\s+down|count|focus|instead|"
-            r"hours|lowest|remote[-\s]?day)\b"
+            r"hours|lowest|remote[-\s]?day|highest (?:operational )?risk|which (?:one|request)|why|"
+            r"urgent|urgency|recommend|approve|approval|confirm|confirmation|prepare|impact|"
+            r"what happens|if i approve|request)\b"
         )
     elif subject == "team_conflict":
         signals.append(
@@ -1574,7 +2358,7 @@ def continuation_intent(message: str, inherited: dict | None) -> str | None:
         )
     elif subject == "approval_decision":
         signals.append(
-            r"\b(approve|reject|status|why|reason|it|that request|same request)\b"
+            r"\b(approve|reject|status|why|reason|it|that request|same request|confirm|confirmation|prepare)\b"
         )
     elif subject == "team_roster":
         signals.append(
@@ -1590,11 +2374,35 @@ def continuation_intent(message: str, inherited: dict | None) -> str | None:
             r"investigation|recommend|recommendation|actions?|explain|data behind|"
             r"absence rates?|unplanned)\b"
         )
+    elif subject in {"routing_audit", "routing_investigation", "org_transfer"}:
+        signals.append(
+            r"\b(discrepan\w*|urgent|urgency|important|importance|why|steps?|actions?|"
+            r"correct(?:ive)?|remediat\w*|resolve|routing|manager|approval|transfer|"
+            r"same|that|those|it|primary|case|evidence|severity|recommend|"
+            r"should hr|hr (?:do|take|correct|fix)|next steps?)\b"
+        )
     continued = any(re.search(pattern, text) for pattern in signals)
     if not continued and _MONTH_NAME.search(text) and len(text.split()) <= 8:
         continued = True
     if not continued:
         return None
+    # Employee delayed-approval advice follow-ups stay on leave status / own profile.
+    if subject == "leave_history" and re.search(
+        r"\b(approval manager|assigned approver|who (?:is|was) (?:my )?(?:manager|approver)|"
+        r"that pending request|pending request|follow up|next steps?)\b",
+        text,
+    ):
+        if re.search(r"\b(my manager|approval manager|assigned approver|who)\b", text):
+            return "employee_profile"
+        return "leave_request_status"
+    # Approval-inbox / pending-request threads: urgency stays on team analytics;
+    # prepare/confirm becomes an approval decision that reuses the selected request id.
+    if subject in {"approval_inbox", "team_analytics", "approval_decision"}:
+        focus = approval_inbox_followup_focus(text)
+        if focus == "prepare_approve":
+            return "approval_decision"
+        if focus in {"urgency", "why_urgent", "approve_impact", "reject_impact"}:
+            return "team_analytics"
     # Team roster follow-ups about attendance / leave / remote become analytics.
     if subject == "team_roster" and re.search(
         r"\b(remote(?:ly)?|attendance|absent|present|late|sick|worked|leave|balance)\b",
@@ -1607,53 +2415,77 @@ def continuation_intent(message: str, inherited: dict | None) -> str | None:
         text,
     ):
         return "employee_directory"
-    # Org attendance follow-ups about rates / months / offices / anomalies escalate to workforce analytics.
+    # Keep month/increase/department-contribution follow-ups on org_attendance so counts stay deterministic.
     if subject == "org_attendance" and re.search(
-        r"\b(absence rates?|highest absence|compare|last (?:\w+ )?months?|office|location|"
-        r"largest increase|unusual|anomal|pattern|investigation|recommend|recommendation|"
-        r"explain the data|data behind)\b",
+        r"\b(what about|how about|how much|increase|decreased|contributed most|"
+        r"department contributed|september|october|november|december|january|february|"
+        r"march|april|may|june|july|august)\b",
         text,
     ):
+        return "org_attendance"
+    # Org attendance follow-ups about rates / offices / anomalies escalate to workforce analytics.
+    if subject == "org_attendance" and (
+        workforce_followup_question(text)
+        or re.search(
+            r"\b(absence rates?|highest absence|compare|last (?:\w+ )?months?|office|location|"
+            r"largest increase|unusual|anomal|pattern|investigat\w*|recommend|recommendation|"
+            r"operational consequences?|consequences?|explain the data|data behind)\b",
+            text,
+        )
+    ):
         return "workforce_analytics"
+    if subject in {"routing_audit", "routing_investigation", "org_transfer"}:
+        # Keep corrective/urgency/importance follow-ups on the same investigation.
+        focus = org_transfer_followup_focus(text)
+        if focus is not None:
+            return "org_transfer"
+        return "org_transfer"
     return _SUBJECT_INTENT[subject]
 
 
 def classify_with_model(message: str, role: str) -> str | None:
+    from app.ai.llm import PermanentLLMError, TransientLLMError
+
     client = LLMClient()
     if not client.enabled:
         return None
-    raw = client.complete(
-        [
-            {
-                "role": "system",
-                "content": (
-                    "Classify the HR request. Reply with JSON only: "
-                    '{"intent":"leave_planning|leave_request|leave_eligibility|leave_policy|leave_request_status|leave_cancellation|leave_balance|team_conflict|team_roster|team_analytics|workforce_analytics|org_transfer|policy_question|confidential_lookup|employee_profile|attendance_query|holiday_query|employee_directory|org_attendance|org_leave|compensation_query|hr_metrics|hr_action|out_of_scope|general_hr"}. '
-                    "A question about whether leave is allowed is leave_eligibility. A notice or rule question is leave_policy. "
-                    "Only an explicit request to prepare or submit leave is leave_request or leave_planning. "
-                    "A manager asking for their own direct reports or team roster is team_roster, never employee_directory. "
-                    "Manager questions about their team's attendance, late arrivals, missing attendance, pending leave, "
-                    "currently on leave, awaiting my approval, or leave balances are team_analytics, never org_attendance or org_leave. "
-                    "An employee's own leave history or approved requests without approval decisions is leave_request_status. "
-                    "Asking whether the employee is eligible for another leave request is leave_eligibility, not leave_request. "
-                    "Headcount, a department roster, managers, and a named employment profile are employee_directory, never workforce_analytics. "
-                    "Organization attendance is org_attendance. Organization leave is org_leave. Salary totals and averages are compensation_query. "
-                    "Do not select an employee and do not decide permissions."
-                ),
-            },
-            {"role": "user", "content": f"Role: {role}\nRequest:\n{message}"},
-        ],
-        temperature=0,
-        max_tokens=80,
-    )
-    if not raw:
-        return None
-    parsed = parse_json_object(raw)
-    if not parsed:
+    try:
+        parsed = client.complete_json(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "Classify the HR request. Reply with JSON only: "
+                        '{"intent":"leave_planning|leave_request|leave_eligibility|leave_policy|leave_request_status|leave_cancellation|leave_balance|team_conflict|team_roster|team_analytics|workforce_analytics|org_transfer|policy_question|confidential_lookup|employee_profile|attendance_query|holiday_query|employee_directory|org_attendance|org_leave|compensation_query|hr_metrics|hr_action|out_of_scope|general_hr"}. '
+                        "Never return approval_decision; approve/reject decisions are handled outside this classifier. "
+                        "A question about whether leave is allowed is leave_eligibility. A notice or rulebook question is leave_policy. "
+                        "Drafting, preparing, or submitting leave — including 'draft so I can confirm' or 'who would approve' — is leave_request. "
+                        "A manager asking which leave asks are in their inbox, waiting on their decision, or need sign-off is team_analytics. "
+                        "A manager asking for their own direct reports or team roster is team_roster, never employee_directory. "
+                        "Manager questions about their team's attendance, late arrivals, missing attendance, pending leave, "
+                        "currently on leave, awaiting my approval, or leave balances are team_analytics, never org_attendance or org_leave. "
+                        "An employee's own leave history or approved requests without drafting a new request is leave_request_status. "
+                        "Asking whether the employee is eligible for another leave request is leave_eligibility, not leave_request. "
+                        "Compensation band notes, pay bands, and compensation policy documents are policy_question, never confidential_lookup. "
+                        "Headcount, a department roster, managers, and a named employment profile are employee_directory, never workforce_analytics. "
+                        "Organization attendance is org_attendance. Organization leave is org_leave. Salary totals and averages are compensation_query. "
+                        "Do not select an employee and do not decide permissions."
+                    ),
+                },
+                {"role": "user", "content": f"Role: {role}\nRequest:\n{message}"},
+            ],
+            temperature=0,
+            max_tokens=80,
+            raise_on_error=True,
+        )
+    except (TransientLLMError, PermanentLLMError):
         return None
     intent = parsed.get("intent")
     if intent == "self_service":
         intent = "employee_profile"
+    # approval_decision must only come from parse_approval_decision, never the LLM.
+    if intent == "approval_decision":
+        return None
     return intent if intent in ALLOWED_INTENTS else None
 
 

@@ -205,6 +205,8 @@ def _narrate(state: dict) -> tuple[str, str]:
         return _organization(state)
     if intent == "team_roster":
         return _team_roster(state)
+    if (state.get("analysis") or {}).get("kind") == "approval_inbox":
+        return _approval_inbox(state)
     if intent == "team_analytics":
         return _team_analytics(state)
     if intent == "out_of_scope":
@@ -236,6 +238,8 @@ def _leave(state: dict) -> tuple[str, str]:
     balance = analysis.get("balance") or {}
     recommended = analysis.get("recommended_window")
     focus = analysis.get("focus") or state.get("leave_focus") or "plan"
+    if focus == "recommend_dates":
+        return _recommend_leave_dates(state)
     if not requested:
         return "I could not build a leave plan from the records.", "Leave plan unavailable."
     blocks = requested.get("hard_blocks") or []
@@ -300,6 +304,92 @@ def _leave(state: dict) -> tuple[str, str]:
                 f"No assigned project deadline falls inside {requested.get('label')} ({start} to {end}).",
                 "I did not invent project deadlines.",
             ]
+        return "\n".join(lines), summary
+
+    if focus == "coverage":
+        overlaps = requested.get("overlaps") or []
+        available_pct = requested.get("available_pct")
+        team_size = requested.get("team_size")
+        available_after = requested.get("available_after")
+        summary = (
+            f"Team availability would be {available_pct:.0%} during {requested.get('label')}."
+            if available_pct is not None
+            else f"Coverage check for {requested.get('label')}."
+        )
+        lines = [
+            f"Limited team coverage check for your planned window {requested.get('label')} "
+            f"({start} to {end}, {business_days} business days):",
+        ]
+        if team_size is not None and available_after is not None and available_pct is not None:
+            lines.append(
+                f"If you are out, estimated team availability is {available_after} of {team_size} "
+                f"({available_pct:.0%}), based on pending/approved leave that overlaps this window."
+            )
+        if overlaps:
+            names = ", ".join(sorted({item.get("full_name") for item in overlaps if item.get("full_name")}))
+            lines.append(
+                f"Other overlapping leave already on your team in this window: {names}. "
+                "This is operational scheduling context only; it does not include salaries, medical notes, or private balances."
+            )
+        else:
+            lines.append("No other pending or approved leave on your team overlaps this window.")
+        critical = [item for item in requested.get("projects") or [] if item.get("critical_conflict")]
+        if critical:
+            lines.append(
+                "Critical project deadline(s) inside the window: "
+                + ", ".join(f"{item['name']} on {format_day(item['deadline'])}" for item in critical)
+                + "."
+            )
+        if blocks:
+            lines.append("This window is not currently eligible to submit: " + " ".join(blocks))
+        return "\n".join(lines), summary
+
+    if focus == "prerequisites":
+        summary = "Checklist before submitting the planned leave request."
+        lines = [
+            f"Before submitting leave for {requested.get('label')} ({start} to {end}):",
+            f"1. Confirm duration: {business_days} business day(s).",
+            f"2. Confirm remaining {leave_type} balance covers the request (currently {remaining}).",
+            f"3. Notice available: {requested.get('notice_business_days')} business days; "
+            f"required for this duration: {requested.get('notice_required')}.",
+        ]
+        chain = requested.get("approval_chain") or []
+        if chain:
+            lines.append(
+                "4. Approval path: " + " → ".join(f"{step['full_name']} ({step['role']})" for step in chain) + "."
+            )
+        else:
+            lines.append("4. An approval manager must be on record before routing.")
+        if requested.get("hr_required"):
+            lines.append("5. People Operations co-approval is required for this window.")
+        else:
+            lines.append("5. People Operations co-approval is not required for this window under current rules.")
+        if blocks:
+            lines.append("Outstanding blockers (must be resolved before submit): " + " ".join(blocks))
+        else:
+            lines.append(
+                "No hard blockers remain. Next step is to prepare the draft and explicitly confirm submission."
+            )
+        return "\n".join(lines), summary
+
+    if focus == "balance_check":
+        summary = (
+            f"Remaining {leave_type} balance is {remaining}; requested window needs {business_days} business days."
+        )
+        lines = [
+            f"For {requested.get('label')} ({start} to {end}):",
+            f"Requested business days: {business_days}.",
+            f"Remaining {leave_type} balance: {remaining}.",
+        ]
+        if remaining is not None and business_days is not None and remaining < business_days:
+            lines.append(
+                f"You cannot afford this duration from the current balance. "
+                f"At most {remaining} business day(s) can be planned."
+            )
+        else:
+            lines.append("Your current remaining balance covers this requested duration.")
+        if blocks:
+            lines.append("Other blockers: " + " ".join(blocks))
         return "\n".join(lines), summary
 
     if focus == "approvals":
@@ -517,6 +607,71 @@ def _request_line(item: dict) -> list[str]:
     return lines
 
 
+def _recommend_leave_dates(state: dict) -> tuple[str, str]:
+    analysis = state.get("analysis") or {}
+    balance = analysis.get("balance") or {}
+    options = analysis.get("recommended_options") or []
+    best = analysis.get("recommended_window") or analysis.get("requested_window") or (options[0] if options else None)
+    days = analysis.get("assumed_business_days")
+    remaining = balance.get("remaining", 0)
+    leave_type = balance.get("leave_type") or analysis.get("leave_type") or "annual"
+    if not best:
+        summary = "I could not recommend leave dates from the current balance and team coverage records."
+        return summary + " No leave request was created.", summary
+    summary = (
+        f"Best available window for about {days} business day(s) of {leave_type} leave: "
+        f"{best.get('label')} (risk {best.get('risk_level')})."
+    )
+    lines = [
+        summary,
+        f"Remaining {leave_type} balance used for this recommendation: {remaining} day(s).",
+        f"Duration assumed: {days} business day(s)"
+        + (
+            " from your message."
+            if analysis.get("duration_source") == "stated"
+            else " from remaining-balance guidance (default up to 5 when balance allows)."
+        ),
+        f"Team coverage if you are out: {best.get('available_after')} of {best.get('team_size')} "
+        f"available ({best.get('available_pct', 0):.0%}).",
+        f"Notice available for that start: {best.get('notice_business_days')} business days "
+        f"(required for this duration: {best.get('notice_required')}).",
+    ]
+    calendar = best.get("holiday_calendar") or {}
+    holidays = calendar.get("holidays_in_window") or []
+    if holidays:
+        lines.append(
+            f"Holidays inside the recommended window ({calendar.get('location') or 'your office'}): "
+            + ", ".join(holidays)
+            + "."
+        )
+    else:
+        lines.append("No company holidays fall inside the top recommended window; weekends are still excluded.")
+    overlaps = best.get("overlaps") or []
+    if overlaps:
+        names = ", ".join(sorted({item.get("full_name") for item in overlaps if item.get("full_name")}))
+        lines.append(f"Overlapping team leave in that window: {names}.")
+    else:
+        lines.append("No other pending or approved team leave overlaps the top recommended window.")
+    blocks = best.get("hard_blocks") or []
+    risks = best.get("risks") or []
+    if blocks:
+        lines.append("Policy or balance blocks on the top window: " + " ".join(blocks))
+    if risks:
+        lines.append("Operational considerations: " + " ".join(risks))
+    if len(options) > 1:
+        lines.append("Other suitable windows ranked by coverage and policy fit:")
+        for item in options[1:3]:
+            lines.append(
+                f"- {item.get('label')}: coverage {item.get('available_pct', 0):.0%}, "
+                f"risk {item.get('risk_level')}, notice {item.get('notice_business_days')} business days."
+            )
+    for rule in analysis.get("rules_applied") or []:
+        lines.append(rule)
+    lines.append("No leave request was drafted or submitted. Ask me to prepare a leave request if you want to proceed.")
+    lines.append(_cite_line(state.get("citations") or []))
+    return "\n\n".join(line for line in lines if line), summary
+
+
 def _status(state: dict) -> tuple[str, str]:
     analysis = state.get("analysis") or {}
     requests = analysis.get("requests") or []
@@ -525,6 +680,58 @@ def _status(state: dict) -> tuple[str, str]:
         summary = "I cannot modify a leave request from chat. No request was changed."
         return summary, summary
     report_filter = analysis.get("filter")
+    if report_filter == "delayed_approval" or analysis.get("focus") == "delayed_approval":
+        advice = analysis.get("advice") or {}
+        if not requests:
+            summary = (
+                "You have no leave requests currently waiting on a manager or HR decision."
+            )
+            lines = [
+                summary,
+                "If you expected a pending request, check whether it was already approved, rejected, or cancelled.",
+                "Approval process:",
+            ]
+            for step in advice.get("process") or [
+                "Leave requests first wait in pending_manager for the approval manager on your employee record.",
+                "People Operations co-approval (pending_hr) applies after the manager for longer or critical-deadline requests.",
+            ]:
+                lines.append(f"- {step}")
+            lines.append("Appropriate next steps:")
+            for step in advice.get("next_steps") or [
+                "Ask me to show your latest leave request status if you are unsure what happened.",
+                "Follow up with your approval manager only if a request is still pending_manager.",
+                "Do not submit a duplicate leave request unless you intentionally want a new request.",
+            ]:
+                lines.append(f"- {step}")
+            if advice.get("approval_manager"):
+                lines.append(f"Your recorded approval manager is {advice['approval_manager']}.")
+            lines.append("I did not create or submit a leave request.")
+            return "\n".join(lines), summary
+        oldest = requests[0]
+        summary = (
+            f"{len(requests)} leave request(s) are still awaiting approval. "
+            f"Oldest pending request {oldest.get('id')} is status {oldest.get('status')}."
+        )
+        lines = [summary]
+        for item in requests[:8]:
+            approver = item.get("assigned_approver") or advice.get("approval_manager") or "your approval manager"
+            lines.append(
+                f"- Request {item.get('id')}: {item.get('leave_type')} {item.get('start')} to {item.get('end')}, "
+                f"{item.get('business_days')} business days, status {item.get('status')}, "
+                f"assigned approver {approver}"
+                + (f", submitted {item.get('submitted_at')}" if item.get("submitted_at") else "")
+                + "."
+            )
+        lines.append("Approval process:")
+        for step in advice.get("process") or []:
+            lines.append(f"- {step}")
+        lines.append("Appropriate next steps:")
+        for step in advice.get("next_steps") or []:
+            lines.append(f"- {step}")
+        if advice.get("approval_manager"):
+            lines.append(f"Your recorded approval manager is {advice['approval_manager']}.")
+        lines.append("No leave request was created, changed, approved, or rejected by the assistant.")
+        return "\n".join(lines), summary
     if report_filter == "year_status_summary":
         by_status = analysis.get("by_status") or {}
         approved_n = int(by_status.get("approved") or 0)
@@ -703,17 +910,23 @@ def _latest_question_lines(latest: dict, question: str) -> list[str]:
 
 def _approval_decision(state: dict) -> tuple[str, str]:
     analysis = state.get("analysis") or {}
+    pending = state.get("pending_action") or {}
     message = analysis.get("message") or "No approval decision was recorded."
     status = analysis.get("status") or ""
     summary = f"Approval decision: {status}." if status else "Approval decision."
     lines = [message]
+    if status == "awaiting_confirmation":
+        summary = "Approval decision awaiting confirmation."
+        if pending.get("confirmation_prompt"):
+            lines.append(pending["confirmation_prompt"])
+        lines.append("Reply yes to confirm, or cancel to leave records unchanged.")
     if analysis.get("request_id") is not None and status not in {"needs_clarification", "needs_reason"}:
         lines.append(f"Leave request id: {analysis.get('request_id')}.")
     if analysis.get("approval_id") is not None:
         lines.append(f"Approval id: {analysis.get('approval_id')}.")
     if analysis.get("reason"):
         lines.append(f"Reason recorded: {analysis.get('reason')}.")
-    if status == "denied":
+    if status in {"denied", "duplicate", "blocked", "expired", "not_found"}:
         lines.append("No leave request status was changed.")
     return "\n".join(lines), summary
 
@@ -722,40 +935,64 @@ def _team(state: dict) -> tuple[str, str]:
     analysis = state.get("analysis") or {}
     window = analysis.get("window") or {}
     requests = analysis.get("requests") or []
+    pairs = analysis.get("overlap_pairs") or []
     rec = analysis.get("recommendation") or {}
     if not analysis:
         return "I could not find team leave records for your management scope.", "Team analysis unavailable."
-    if not requests:
+    team_size = analysis.get("team_size", 0)
+    if pairs:
+        summary = (
+            f"{len(pairs)} overlapping leave pair(s) among your direct reports "
+            f"(pending or approved leave with intersecting dates). Overall staffing risk: {analysis.get('risk_level')}."
+        )
+        lines = [
+            summary,
+            f"Scope: {analysis.get('scope') or 'direct_reports'} only ({team_size} direct reports). "
+            "Organization-wide attendance analytics were not used.",
+        ]
+        for item in pairs[:12]:
+            lines.append(
+                f"- {item.get('left_name')} (request {item.get('left_request_id')}, {item.get('left_status')}, "
+                f"{item.get('left_start')} to {item.get('left_end')}) overlaps "
+                f"{item.get('right_name')} (request {item.get('right_request_id')}, {item.get('right_status')}, "
+                f"{item.get('right_start')} to {item.get('right_end')}) on "
+                f"{item.get('overlap_start')} to {item.get('overlap_end')} "
+                f"({item.get('overlap_business_days')} business day(s)). "
+                f"Coverage while both are out: {item.get('available_pct', 0):.0%}. "
+                f"Operational risk: {item.get('operational_risk')} — {item.get('risk_explanation')}"
+            )
+        if len(pairs) > 12:
+            lines.append(f"...and {len(pairs) - 12} additional overlap pair(s).")
+    elif not requests:
         summary = "No overlapping approved or pending leave was found in the review window for your direct reports."
         lines = [
             summary,
-            f"Team size: {analysis.get('team_size', 0)} direct reports.",
+            f"Team size: {team_size} direct reports.",
             f"Review window considered: {window.get('label') or 'next 75 days'}.",
             "Availability uses team size minus distinct people with overlapping approved or pending leave.",
         ]
         return "\n\n".join(lines), summary
+    else:
     summary = (
         f"{len(requests)} overlapping requests in the {window.get('label')}. "
         f"Availability is {analysis.get('available_pct', 0):.0%} before any change. Risk is {analysis.get('risk_level')}."
     )
-    lines = [summary, f"Team size used in the calculation: {analysis.get('team_size')} direct reports."]
-    if requests:
+        lines = [summary, f"Team size used in the calculation: {team_size} direct reports."]
         detail = "; ".join(
-            f"{item['full_name']} ({item['business_days']} days, {item['start_date']} to {item['end_date']}, {item['status']})"
+            f"{item['full_name']} (request {item.get('request_id')}, {item['business_days']} days, "
+            f"{item['start_date']} to {item['end_date']}, {item['status']})"
             for item in requests
         )
         lines.append(detail + ".")
-    else:
-        lines.append("No approved or pending team leave falls in the next 75 days.")
     projects = analysis.get("projects") or []
     if projects:
         lines.append(
-            "Deadlines touching this week: "
+            "Deadlines touching the densest week: "
             + ", ".join(f"{item['name']} ({item['criticality']}, {item['deadline']})" for item in projects)
             + "."
         )
-    else:
-        lines.append("No assigned project deadline falls in that week.")
+    elif requests or pairs:
+        lines.append("No assigned project deadline falls in the densest overlapping week.")
     defer = rec.get("defer") or []
     keep = rec.get("can_consider") or []
     if defer:
@@ -765,7 +1002,7 @@ def _team(state: dict) -> tuple[str, str]:
             + f". Projected availability becomes {rec.get('projected_available_pct', 0):.0%}."
         )
     if keep:
-        lines.append("Still inside the week after that deferral: " + ", ".join(item["full_name"] for item in keep) + ".")
+        lines.append("Still inside the densest week after that deferral: " + ", ".join(item["full_name"] for item in keep) + ".")
     for alternative in rec.get("alternatives") or []:
         lines.append(alternative)
     lines.append("This is a recommendation for you to decide. I have not approved or rejected any request.")
@@ -847,6 +1084,16 @@ def _analytics(state: dict) -> tuple[str, str]:
         return "\n".join(lines), summary
     if focus == "anomaly":
         anomalies = analysis.get("anomalies") or analytics.get("anomalies") or []
+        scope = analysis.get("scope") or analytics.get("scope") or "organization"
+        scope_label = analysis.get("scope_label") or analytics.get("scope_label") or ""
+        if scope == "team":
+            summary = (
+                f"Unusual attendance patterns among {scope_label or 'your direct reports'} "
+                "from the attendance extract."
+            )
+        elif scope == "self":
+            summary = "Unusual attendance patterns in your own attendance extract."
+        else:
         summary = "Organization-wide unusual attendance patterns from the attendance extract."
         lines = [
             summary,
@@ -887,9 +1134,43 @@ def _analytics(state: dict) -> tuple[str, str]:
         for note in limitations:
             lines.append(f"Limitation: {note}")
         return "\n".join(lines), summary
+    if focus == "highest_department":
+        departments = analysis.get("departments") or analytics.get("departments") or []
+        ranked = sorted(
+            departments,
+            key=lambda item: (
+                -float(item.get("unplanned_absence_rate") or 0),
+                -int(item.get("unplanned_absent") or 0),
+                item.get("department") or "",
+            ),
+        )
+        top = ranked[0] if ranked else None
+        if not top:
+            summary = "No department absenteeism ranking is available for this period."
+            return summary, summary
+        summary = (
+            f"{top.get('department')} has the highest unplanned absenteeism in this period at "
+            f"{float(top.get('unplanned_absence_rate') or 0):.1%} "
+            f"({top.get('unplanned_absent', 0)} of {top.get('scheduled_days', 0)} weekday attendance rows)."
+        )
+        lines = [
+            summary,
+            f"Period {period.get('start')} to {period.get('end')}. Scope: {analytics.get('scope')}.",
+            method,
+            "Departments ranked by unplanned absence rate (absent + sick over stored weekday rows):",
+        ]
+        for item in ranked[:8]:
+            lines.append(
+                f"{item.get('department')}: {float(item.get('unplanned_absence_rate') or 0):.1%} "
+                f"({item.get('unplanned_absent', 0)}/{item.get('scheduled_days', 0)})."
+                )
+        for note in limitations:
+            lines.append(f"Limitation: {note}")
+        return "\n".join(lines), summary
     if focus == "investigation":
         ranked = analysis.get("investigation") or analytics.get("investigation") or []
-        summary = "Departments ranked for further attendance investigation."
+        people = analysis.get("priority_employees") or analytics.get("priority_employees") or []
+        summary = "Attendance records and departments HR should investigate next."
         lines = [
             summary,
             (
@@ -900,6 +1181,8 @@ def _analytics(state: dict) -> tuple[str, str]:
         ]
         if not ranked:
             lines.append("No departments were available to rank.")
+        else:
+            lines.append("Priority departments:")
         for item in ranked[:8]:
             sample = " small-sample caution;" if item.get("small_sample") else ""
             lines.append(
@@ -908,16 +1191,51 @@ def _analytics(state: dict) -> tuple[str, str]:
                 f"month change {item['month_change_pp']:+.2f} pp; "
                 f"anomaly months {item['anomaly_count']}{sample}."
             )
+        if people:
+            lines.append("Priority employee attendance records (highest unplanned absent/sick row counts):")
+            for item in people[:8]:
+                lines.append(
+                    f"{item.get('full_name')} ({item.get('employee_number') or 'n/a'}, {item.get('department') or 'unknown'}): "
+                    f"{item.get('unplanned_absent', 0)} unplanned rows of {item.get('scheduled_days', 0)} "
+                    f"({float(item.get('unplanned_absence_rate') or 0):.1%})."
+                )
+        lines.append(
+            "These are operational review prompts from stored attendance rows only. "
+            "They are not findings of misconduct or medical conditions."
+            )
         return "\n".join(lines), summary
-    if focus == "recommendations":
+    if focus in {"recommendations", "consequences"}:
         rec = analysis.get("recommendations") or analytics.get("recommendations") or {}
         actions = rec.get("actions") or []
+        if focus == "consequences":
+            summary = "Possible operational consequences grounded in the attendance analytics."
+            lines = [
+                summary,
+                (
+                    "These consequences follow from elevated unplanned absence rates, month-to-month increases, "
+                    "and outlier department-months in the current analytics window. "
+                    "They are operational risks, not confirmed incidents."
+                ),
+            ]
+            if actions:
+                lines.append("Likely operational impacts and review actions:")
+            else:
+                lines.append("No evidence-based operational consequences are available for this scope.")
+        else:
         summary = "HR actions grounded in the preceding organization-wide attendance analytics."
         lines = [summary]
         if not actions:
             lines.append("No evidence-based attendance actions are available for this scope.")
         for action in actions:
             lines.append(f"- {action}")
+        if focus == "consequences":
+            lines.extend(
+                [
+                    "- Coverage gaps: teams with rising unplanned absence may need temporary staffing or shifted delivery dates.",
+                    "- Approval backlog risk: more short-notice sick/absent days can increase same-week leave pressure.",
+                    "- Data-quality review: outlier department-months should be validated before any personnel action.",
+                ]
+            )
         defs = rec.get("metric_definitions") or {}
         if defs:
             lines.append("Metric definitions used:")
@@ -1042,9 +1360,274 @@ def _analytics(state: dict) -> tuple[str, str]:
 
 def _transfer(state: dict) -> tuple[str, str]:
     analysis = state.get("analysis") or {}
+    focus = (analysis.get("focus") or "").lower()
+    pending = state.get("pending_action") or {}
+    if pending.get("type") == "file_routing_correction" and pending.get("pending_action_id"):
+        correction = pending.get("correction") or analysis.get("correction") or {}
+        summary = "Routing correction prepared; awaiting your confirmation."
+        prompt = pending.get("confirmation_prompt") or (
+            f"File this routing correction for People Operations on employee "
+            f"#{correction.get('subject_employee_id')}? "
+            f"It would move approval_manager_id from {correction.get('from_name')} to {correction.get('to_name')}."
+        )
+        text = (
+            f"{summary}\n{prompt}\n"
+            "No record has been changed yet. Confirm to file the People Operations request, or cancel."
+        )
+        return text, summary
+    if analysis.get("kind") in {"routing_audit", "routing_investigation"}:
     if analysis.get("consistent"):
-        summary = "Approval routing matches your current manager."
-        text = summary + " I did not find a stale approval manager on your record."
+            if analysis.get("kind") == "routing_investigation":
+                mgr = (analysis.get("current_manager") or {}).get("full_name") or "not recorded"
+                appr = (analysis.get("approval_manager") or {}).get("full_name") or "not recorded"
+                dept = analysis.get("current_department") or "not recorded"
+                conflicting = analysis.get("conflicting_values") or {}
+                summary = (
+                    f"Your department and reporting-manager records are consistent. "
+                    f"Department: {dept}. Reporting manager: {mgr}. Approval manager: {appr}."
+                )
+                lines = [
+                    summary,
+                    (
+                        f"PostgreSQL values: department_id={conflicting.get('department_id')}, "
+                        f"manager_id={conflicting.get('manager_id')}, "
+                        f"approval_manager_id={conflicting.get('approval_manager_id')}."
+                    ),
+                    "No discrepancy was found, and no correction is needed.",
+                ]
+                lines.append(_cite_line(state.get("citations") or []))
+                return "\n".join(lines), summary
+            summary = "No active employees have a manager_id / approval_manager_id mismatch."
+            return summary + " The org-wide routing scan found no transfer discrepancies.", summary
+
+        primary = analysis.get("most_urgent") or analysis
+        if analysis.get("kind") == "routing_investigation":
+            primary = analysis
+        emp = primary.get("employee") or {}
+        emp_name = emp.get("full_name") or "the employee"
+        severity = primary.get("severity") or analysis.get("severity") or "unknown"
+        correction = primary.get("correction") or analysis.get("correction") or {}
+        misrouted = primary.get("open_requests_following_old_route") or []
+        evidence = primary.get("evidence") or analysis.get("evidence") or []
+        conflicting = primary.get("conflicting_values") or analysis.get("conflicting_values") or {}
+        record_status = primary.get("record_status") or analysis.get("record_status")
+        missing_fields = primary.get("missing_fields") or analysis.get("missing_fields") or []
+
+        if focus == "urgency":
+            summary = (
+                f"Most urgent discrepancy: {primary.get('issue') or analysis.get('issue')} "
+                f"(severity={severity})."
+            )
+            lines = [
+                summary,
+                (
+                    f"{emp_name} reports to {(primary.get('current_manager') or {}).get('full_name') or 'nobody'}, "
+                    f"but leave approval still routes to "
+                    f"{(primary.get('approval_manager') or {}).get('full_name') or 'nobody'}."
+                ),
+            ]
+            if misrouted:
+                lines.append(
+                    f"{len(misrouted)} open leave request(s) still follow the previous approval route, "
+                    "which is why this case outranks mismatches without open leave."
+                )
+            elif primary.get("transfer_effective_date") or primary.get("prior_department"):
+                lines.append(
+                    "No open leave is misrouted right now, but the transfer date / prior department "
+                    "make this a high-priority stale-ownership case."
+                )
+            lines.append("This is an investigation result only. No HR correction has been filed.")
+            lines.append(_cite_line(state.get("citations") or []))
+            return "\n".join(lines), summary
+
+        if focus == "importance":
+            why = analysis.get("why_important") or (
+                "Stale approval ownership delays leave decisions and leaves open requests with the wrong manager "
+                "after a department transfer."
+            )
+            summary = f"Why this discrepancy matters: {why}"
+            lines = [
+                summary,
+                (
+                    f"Affected employee: {emp_name}. Severity: {severity}. "
+                    f"Department: {conflicting.get('department_name') or primary.get('current_department') or 'unknown'}; "
+                    f"manager_id={conflicting.get('manager_id')}; "
+                    f"approval_manager_id={conflicting.get('approval_manager_id')}; "
+                    f"transfer_effective_date={conflicting.get('transfer_effective_date') or primary.get('transfer_effective_date') or 'not recorded'}."
+                ),
+            ]
+            if evidence:
+                lines.append("Evidence from PostgreSQL employee / leave records:")
+                lines.extend(f"- {item}" for item in evidence[:8])
+            lines.append("No approval, rejection, or record change was initiated.")
+            lines.append(_cite_line(state.get("citations") or []))
+            return "\n".join(lines), summary
+
+        if focus == "remediation":
+            mgr_name = (primary.get("current_manager") or {}).get("full_name") or conflicting.get("manager_name")
+            appr_name = (primary.get("approval_manager") or {}).get("full_name") or conflicting.get(
+                "approval_manager_name"
+            )
+            summary = f"Recommended HR corrective steps for {emp_name}."
+            lines = [
+                summary,
+                (
+                    f"Investigation remains on {emp_name}"
+                    + (f" (severity={severity})" if severity else "")
+                    + (
+                        f": reports to {mgr_name}, leave approval still routed to {appr_name}."
+                        if mgr_name or appr_name
+                        else "."
+                    )
+                ),
+                "Verification steps before changing records:",
+                (
+                    f"- Confirm PostgreSQL employees.manager_id="
+                    f"{conflicting.get('manager_id')} ({mgr_name or 'missing'}) and "
+                    f"employees.approval_manager_id={conflicting.get('approval_manager_id')} "
+                    f"({appr_name or 'missing'}) for employee_id="
+                    f"{primary.get('employee_id') or analysis.get('employee_id')}."
+                ),
+                (
+                    f"- Confirm department_id={conflicting.get('department_id')} "
+                    f"({conflicting.get('department_name') or primary.get('current_department') or 'missing'}) "
+                    f"and transfer_effective_date="
+                    f"{conflicting.get('transfer_effective_date') or primary.get('transfer_effective_date') or 'not recorded'}."
+                ),
+            ]
+            if misrouted:
+                lines.append(
+                    f"- Review {len(misrouted)} open leave request(s) still routed to the previous approver "
+                    "before rewriting approval ownership."
+                )
+            lines.append("Recommended correction steps:")
+            for action in analysis.get("recommended_actions") or [
+                "Update approval_manager_id to the current line manager.",
+                "Re-route any open pending leave still pointed at the previous approver.",
+                "Confirm department_id, manager_id, approval_manager_id, and transfer_effective_date were updated together.",
+            ]:
+                lines.append(f"- {action}")
+            if primary.get("recommended_correction") or analysis.get("recommended_correction"):
+                lines.append(
+                    f"Primary record correction: "
+                    f"{primary.get('recommended_correction') or analysis.get('recommended_correction')}"
+                )
+            if correction:
+                lines.append(
+                    f"Concrete field change: set approval_manager_id from {correction.get('from_name')} "
+                    f"to {correction.get('to_name')} for subject_employee_id="
+                    f"{correction.get('subject_employee_id') or primary.get('employee_id')}."
+                )
+            lines.append(
+                "These are recommended steps only. No employee record has been changed. "
+                "I will not file a correction unless you explicitly ask me to file that correction and then confirm."
+            )
+            lines.append(_cite_line(state.get("citations") or []))
+            return "\n".join(lines), summary
+
+        # Default investigation / summary narration.
+        if analysis.get("kind") == "routing_audit":
+            summary = analysis.get("issue") or f"Found {analysis.get('case_count', 0)} routing discrepancies."
+            lines = [summary]
+            if analysis.get("likely_cause"):
+                lines.append(f"Likely cause: {analysis['likely_cause']}")
+            for case in analysis.get("cases") or []:
+                case_emp = case.get("employee") or {}
+                lines.append(
+                    f"- {case_emp.get('full_name') or 'Employee'} ({case.get('employee_number') or 'n/a'}): "
+                    f"severity={case.get('severity') or 'unknown'}; "
+                    f"department {case.get('current_department') or 'unknown'}"
+                    + (
+                        f" (prior {case.get('prior_department')})"
+                        if case.get("prior_department")
+                        else ""
+                    )
+                    + f"; transfer date {case.get('transfer_effective_date') or 'not recorded'}; "
+                    f"reports to {(case.get('current_manager') or {}).get('full_name') or 'nobody'}, "
+                    f"leave approval still {(case.get('approval_manager') or {}).get('full_name') or 'nobody'}."
+                )
+                case_misrouted = case.get("open_requests_following_old_route") or []
+                if case_misrouted:
+                    lines.append(
+                        "  Open requests still on the previous route: "
+                        + ", ".join(
+                            f"#{item.get('request_id')} → {item.get('routed_to')}" for item in case_misrouted
+                        )
+                        + "."
+                    )
+                if case.get("recommended_correction"):
+                    lines.append(f"  Recommended correction: {case['recommended_correction']}")
+            for action in analysis.get("recommended_actions") or []:
+                lines.append(f"Recommended action: {action}")
+            if correction:
+                lines.append(
+                    f"For the primary case, the corrective change would set approval_manager_id from "
+                    f"{correction.get('from_name')} to {correction.get('to_name')}. "
+                    "I cannot apply that change without an explicit filing request and confirmation."
+                )
+            lines.append(_cite_line(state.get("citations") or []))
+            return "\n".join(lines), summary
+
+        # Personal routing_investigation with a real mismatch or missing fields.
+        if analysis.get("kind") == "routing_investigation":
+            if record_status == "missing" or missing_fields:
+                summary = (
+                    analysis.get("issue")
+                    or f"Required routing field(s) are missing: {', '.join(missing_fields) or 'unknown'}."
+                )
+                lines = [
+                    summary,
+                    (
+                        f"Current department: {analysis.get('current_department') or 'missing'}. "
+                        f"Reporting manager: {(analysis.get('current_manager') or {}).get('full_name') or 'missing'}. "
+                        f"Approval manager: {(analysis.get('approval_manager') or {}).get('full_name') or 'missing'}."
+                    ),
+                    "This is a missing-record finding, not an invented manager identity.",
+                ]
+            else:
+                summary = analysis.get("issue") or (
+                    f"{emp_name} has a reporting-manager / approval-manager mismatch."
+                )
+                lines = [
+                    summary,
+                    (
+                        f"Current department: {analysis.get('current_department') or 'not recorded'}. "
+                        f"Prior department: {analysis.get('prior_department') or 'not recorded'}. "
+                        f"Transfer date: {analysis.get('transfer_effective_date') or 'not recorded'}. "
+                        f"Severity: {severity}."
+                    ),
+                    (
+                        f"PostgreSQL values: department_id={conflicting.get('department_id')}, "
+                        f"manager_id={conflicting.get('manager_id')} "
+                        f"({conflicting.get('manager_name') or 'missing'}), "
+                        f"approval_manager_id={conflicting.get('approval_manager_id')} "
+                        f"({conflicting.get('approval_manager_name') or 'missing'})."
+                    ),
+                ]
+                if analysis.get("recommended_correction"):
+                    lines.append(f"Recommended correction: {analysis['recommended_correction']}")
+                if correction:
+                    lines.append(
+                        f"The corrective change would set the approval manager from {correction.get('from_name')} "
+                        f"to {correction.get('to_name')}. "
+                        "I cannot apply that change unless you explicitly ask to file the correction and then confirm."
+                    )
+                if misrouted:
+                    lines.append(f"{len(misrouted)} open request(s) are still routed to the previous manager.")
+            lines.append(_cite_line(state.get("citations") or []))
+            return "\n".join(lines), summary
+
+    if analysis.get("consistent"):
+        mgr = (analysis.get("current_manager") or {}).get("full_name") or analysis.get("manager")
+        dept = analysis.get("current_department")
+        summary = (
+            f"Approval routing matches your current manager"
+            + (f" ({mgr})" if mgr else "")
+            + "."
+        )
+        text = summary + (
+            f" Department: {dept}." if dept else ""
+        ) + " I did not find a stale approval manager on your record."
         return text, summary
     issue = analysis.get("issue") or "The reporting route looks inconsistent."
     correction = analysis.get("correction") or {}
@@ -1053,19 +1636,24 @@ def _transfer(state: dict) -> tuple[str, str]:
         (
             f"Current department: {analysis.get('current_department')}. "
             f"Prior department: {analysis.get('prior_department') or 'not recorded'}. "
-            f"Transfer date: {analysis.get('transfer_effective_date') or 'not recorded'}."
+            f"Transfer date: {analysis.get('transfer_effective_date') or 'not recorded'}. "
+            f"Severity: {analysis.get('severity') or 'unknown'}."
         ),
     ]
+    if analysis.get("recommended_correction"):
+        lines.append(f"Recommended correction: {analysis['recommended_correction']}")
     if correction:
         lines.append(
             f"The corrective change would set the approval manager from {correction.get('from_name')} to {correction.get('to_name')}. "
-            "I cannot apply that change. If you confirm, I will file a request for People Operations."
+            "I cannot apply that change unless you explicitly ask to file the correction and then confirm."
         )
     misrouted = analysis.get("open_requests_following_old_route") or []
     if misrouted:
         lines.append(f"{len(misrouted)} open request(s) are still routed to the previous manager.")
-    else:
-        lines.append("There is no open leave request right now; new requests will keep using the stale approval manager until HR updates it.")
+    elif analysis.get("record_status") == "mismatch":
+        lines.append(
+            "There is no open leave request right now; new requests will keep using the stale approval manager until HR updates it."
+        )
     lines.append(_cite_line(state.get("citations") or []))
     return "\n\n".join(lines), issue
 
@@ -1097,6 +1685,34 @@ def _person_line(item: dict) -> str:
     if manager:
         parts.append(f"manager {manager}")
     return ", ".join(part for part in parts if part)
+
+
+def _approval_inbox(state: dict) -> tuple[str, str]:
+    analysis = state.get("analysis") or {}
+    rows = analysis.get("approvals") or []
+    count = int(analysis.get("count") or len(rows))
+    display_limit = int(analysis.get("display_limit") or 20)
+    shown = rows[:display_limit]
+    summary = f"{count} pending approval{'s' if count != 1 else ''} in your inbox."
+    if not rows:
+        return summary + " No leave requests are waiting for your decision right now.", summary
+    lines = [summary]
+    if count > len(shown):
+        lines.append(
+            f"Showing first {len(shown)} of {count} pending requests "
+            f"(chat display is capped at {display_limit}; the count above is the full authorized inbox)."
+        )
+    for item in shown:
+        subject = item.get("subject") or "Employee"
+        leave_id = item.get("leave_request_id") or item.get("approval_id")
+        window = ""
+        if item.get("start") and item.get("end"):
+            window = f", {item['start']} to {item['end']}"
+        days = item.get("business_days")
+        days_bit = f", {days} business days" if days is not None else ""
+        lines.append(f"- Request {leave_id}: {subject}{window}{days_bit} ({item.get('status') or 'pending'}).")
+    lines.append("Approve or reject with the leave request id, for example: approve leave request 12.")
+    return "\n".join(lines), summary
 
 
 def _team_roster(state: dict) -> tuple[str, str]:
@@ -1149,6 +1765,158 @@ def _team_analytics(state: dict) -> tuple[str, str]:
         summary = f"{count} approved leave request{'s' if count != 1 else ''} among direct reports."
     elif focus == "awaiting_approval":
         summary = f"{count} leave request{'s' if count != 1 else ''} awaiting your approval."
+    elif focus == "awaiting_approval_risk":
+        highest = records.get("highest") or (people[0] if people else None)
+        if highest:
+            summary = (
+                f"Highest operational risk among your pending approvals is request "
+                f"{highest.get('request_id')} ({highest.get('full_name')}, risk {highest.get('risk_level')})."
+            )
+        else:
+            summary = "There are no pending approvals awaiting your decision."
+        lines = [summary, note]
+        if highest:
+            lines.append(
+                f"Request {highest.get('request_id')}: {highest.get('leave_type')} "
+                f"{highest.get('start')} to {highest.get('end')}, "
+                f"{highest.get('business_days')} business days, status {highest.get('status')}, "
+                f"risk {highest.get('risk_level')}."
+            )
+            risks = highest.get("risks") or []
+            if risks:
+                lines.append("Risk factors: " + " ".join(risks))
+            elif highest.get("critical_conflict"):
+                lines.append("A critical project deadline falls inside this leave window.")
+            if highest.get("hr_required"):
+                lines.append("People Operations co-approval is required for this request.")
+        inbox = records.get("inbox") or people
+        if len(inbox) > 1:
+            lines.append(
+                "Other pending approvals by risk: "
+                + "; ".join(
+                    f"request {item.get('request_id')} ({item.get('full_name')}, {item.get('risk_level')})"
+                    for item in inbox[1:6]
+                )
+                + "."
+            )
+        lines.append("This ranking is decision support only. I have not approved or rejected any request.")
+        return "\n".join(lines), summary
+    elif focus == "awaiting_approval_why_urgent":
+        highest = records.get("highest") or (people[0] if people else None)
+        if not highest:
+            summary = "There is no selected pending approval to explain."
+            return summary, summary
+        summary = (
+            f"Request {highest.get('request_id')} for {highest.get('full_name')} is urgent "
+            f"because its operational risk is {highest.get('risk_level')}."
+        )
+        lines = [summary, note]
+        lines.append(
+            f"Window: {highest.get('leave_type')} {highest.get('start')} to {highest.get('end')} "
+            f"({highest.get('business_days')} business days, status {highest.get('status')})."
+        )
+        risks = highest.get("risks") or []
+        if risks:
+            lines.append("Why it is urgent: " + " ".join(risks))
+        else:
+            reasons = []
+            if highest.get("critical_conflict"):
+                reasons.append("A critical project deadline falls inside this leave window.")
+            if (highest.get("available_pct") or 1) < 0.7:
+                reasons.append(
+                    f"Team coverage would drop to about {float(highest.get('available_pct') or 0):.0%}."
+                )
+            if highest.get("overlap_count"):
+                reasons.append(
+                    f"{highest.get('overlap_count')} overlapping leave request(s) touch the same window."
+                )
+            if highest.get("hr_required"):
+                reasons.append("People Operations co-approval is also required, which lengthens the decision path.")
+            if not reasons:
+                reasons.append(
+                    "It ranks highest among your pending_manager requests by leave length and staffing impact."
+                )
+            lines.append("Why it is urgent: " + " ".join(reasons))
+        lines.append("No approval was executed. Say prepare the approval if you want a confirmation gate.")
+        return "\n".join(lines), summary
+    elif focus == "awaiting_approval_impact":
+        highest = records.get("highest") or (people[0] if people else None)
+        if not highest:
+            summary = "Approving a pending leave request changes status and notifications only after explicit confirmation."
+            lines = [
+                "If you approve a pending leave request after confirmation:",
+                "- The leave request status becomes approved, or pending_hr when People Operations co-approval is required.",
+                "- Reserved pending leave days move toward used once the request is fully confirmed.",
+                "- An in-app employee notification is recorded (no external email provider is configured).",
+                "I have not approved any request. Name a leave request id or ask me to prepare the approval for a selected request, then confirm.",
+            ]
+            return "\n".join(lines), summary
+        summary = (
+            f"If you approve request {highest.get('request_id')} for {highest.get('full_name')}, "
+            f"the leave window {highest.get('start')} to {highest.get('end')} becomes manager-approved."
+        )
+        lines = [summary, note]
+        lines.append(
+            f"Request details: {highest.get('leave_type')}, {highest.get('business_days')} business days, "
+            f"current status {highest.get('status')}, risk {highest.get('risk_level')}."
+        )
+        if highest.get("hr_required"):
+            lines.append(
+                "Because People Operations co-approval is required, your approval alone does not finalize "
+                "the leave; it moves the request to pending_hr."
+            )
+        else:
+            lines.append(
+                "After your confirmed approval, the request can complete manager approval in the HRIS."
+            )
+        if highest.get("critical_conflict"):
+            lines.append("Approving it keeps a critical project deadline inside an approved absence window.")
+        if (highest.get("available_pct") or 1) < 0.7:
+            lines.append(
+                f"Team availability during that window is about {float(highest.get('available_pct') or 0):.0%}, "
+                "below the usual 70% coverage guide."
+            )
+        risks = highest.get("risks") or []
+        if risks:
+            lines.append("Operational considerations: " + " ".join(risks))
+        lines.append(
+            "I have not approved the request. To proceed, ask me to prepare the approval and confirm it."
+        )
+        return "\n".join(lines), summary
+    elif focus == "awaiting_approval_reject_impact":
+        highest = records.get("highest") or (people[0] if people else None)
+        if not highest:
+            summary = "Rejecting a pending leave request changes status, balance reservation, and employee notification only after confirmation."
+            lines = [
+                "If you reject a pending leave request after confirmation:",
+                "- The leave request status becomes rejected and remains in leave history.",
+                "- Reserved pending leave days are released back to the employee's available balance.",
+                "- An in-app employee notification (event leave_rejected) is recorded for the employee; no external email is sent.",
+                "- No approval decision is prepared or executed from this explanation alone.",
+                "I have not rejected any request. Name a leave request id or ask me to prepare a rejection for a selected request, then confirm.",
+            ]
+            return "\n".join(lines), summary
+        summary = (
+            f"If you reject request {highest.get('request_id')} for {highest.get('full_name')}, "
+            f"the leave window {highest.get('start')} to {highest.get('end')} is denied and status becomes rejected."
+        )
+        lines = [summary, note]
+        lines.append(
+            f"Request details: {highest.get('leave_type')}, {highest.get('business_days')} business days, "
+            f"current status {highest.get('status')}, risk {highest.get('risk_level')}."
+        )
+        lines.append(
+            "After a confirmed rejection, reserved pending leave days are released to the employee's balance, "
+            "and an in-app leave_rejected notification is recorded for the employee (no external email)."
+        )
+        lines.append(
+            "The request stays in leave history as rejected. Coverage risk from that window is cleared "
+            "because the leave is not approved."
+        )
+        lines.append(
+            "I have not rejected the request. To proceed, ask me to prepare the rejection with a reason and confirm it."
+        )
+        return "\n".join(lines), summary
     elif focus == "leave_balances":
         summary = f"{count} direct-report annual leave balance{'s' if count != 1 else ''}."
     elif focus == "location_diversity":
@@ -1464,6 +2232,8 @@ def _team_analytics(state: dict) -> tuple[str, str]:
                 f"request {item['request_id']} {item.get('leave_type')} {item.get('start')} to {item.get('end')} "
                 f"{item.get('business_days')} business days status {item.get('status')}"
             )
+            if item.get("risk_level"):
+                extras.append(f"operational risk {item.get('risk_level')}")
         if item.get("grade") and focus == "performance_grades":
             extras.append(f"grade {item.get('grade')}")
         if item.get("performance_rating") is not None and focus == "performance_grades":
@@ -1835,6 +2605,100 @@ def _directory_text(records: dict, note: str) -> tuple[str, str]:
 
 
 def _org_attendance_text(records: dict, note: str) -> tuple[str, str]:
+    if records.get("focus") == "absent_employees":
+        counts = records.get("counts") or {}
+        summary = (
+            f"In {records.get('label')}, {counts.get('absent_employees', 0)} distinct employees were absent "
+            f"({counts.get('absent', 0)} absent attendance rows)."
+        )
+        lines = [
+            summary,
+            note,
+            (
+                f"Present {counts.get('present', 0)}, remote {counts.get('remote', 0)}, "
+                f"sick {counts.get('sick', 0)}, leave {counts.get('leave', 0)}, "
+                f"recorded rows {counts.get('recorded_days', 0)}, "
+                f"absent rate {counts.get('absent_rate_pct')}% of stored rows."
+            ),
+            f"Window: {records.get('start')} to {records.get('end')}.",
+        ]
+        return "\n".join(lines), summary
+    if records.get("focus") in {"period_change", "period_switch", "department_contribution"}:
+        change = records.get("change") or {}
+        previous = records.get("previous") or {}
+        latest = records.get("latest") or {}
+        top = records.get("top_department") or {}
+        if records.get("focus") == "period_switch":
+            summary = (
+                f"In {latest.get('label')}, {change.get('latest_absent_employees', 0)} distinct employees were absent "
+                f"({change.get('latest_absent_rows', 0)} absent rows), compared with "
+                f"{change.get('previous_absent_employees', 0)} employees / {change.get('previous_absent_rows', 0)} rows "
+                f"in {previous.get('label')}."
+            )
+        elif records.get("focus") == "department_contribution":
+            summary = (
+                f"{top.get('department') or 'No department'} contributed the most to the change in absent rows "
+                f"from {previous.get('label')} to {latest.get('label')} "
+                f"({top.get('absent_row_delta', 0):+d} absent rows)."
+            )
+        else:
+            direction = "increased" if (change.get("absent_row_delta") or 0) > 0 else "decreased" if (change.get("absent_row_delta") or 0) < 0 else "did not change"
+            summary = (
+                f"Absent attendance rows {direction} by {abs(change.get('absent_row_delta') or 0)} "
+                f"from {previous.get('label')} to {latest.get('label')}."
+            )
+        lines = [
+            summary,
+            note,
+            (
+                f"{previous.get('label')}: {change.get('previous_absent_employees', 0)} distinct absent employees, "
+                f"{change.get('previous_absent_rows', 0)} absent rows, absent rate "
+                f"{change.get('previous_absent_rate_pct')}% of stored rows."
+            ),
+            (
+                f"{latest.get('label')}: {change.get('latest_absent_employees', 0)} distinct absent employees, "
+                f"{change.get('latest_absent_rows', 0)} absent rows, absent rate "
+                f"{change.get('latest_absent_rate_pct')}% of stored rows."
+            ),
+            (
+                f"Absolute change in absent rows: {change.get('absent_row_delta', 0):+d}. "
+                f"Absolute change in distinct absent employees: {change.get('absent_employee_delta', 0):+d}."
+            ),
+        ]
+        if change.get("absent_row_percent_change") is not None:
+            lines.append(
+                f"Percentage change in absent rows: {change.get('absent_row_percent_change'):+.2f}% "
+                "(100 × delta / previous absent rows)."
+            )
+        if change.get("absent_rate_point_delta") is not None:
+            lines.append(
+                f"Percentage-point change in absent rate: {change.get('absent_rate_point_delta'):+.2f} pp "
+                "(latest absent_rate_pct − previous absent_rate_pct)."
+            )
+        if top:
+            lines.append(
+                f"Largest department contribution by absent-row delta: {top.get('department')} "
+                f"({top.get('previous_absent_rows', 0)} → {top.get('latest_absent_rows', 0)}, "
+                f"{top.get('absent_row_delta', 0):+d} rows"
+                + (
+                    f", {top.get('absent_rate_point_delta'):+.2f} pp"
+                    if top.get("absent_rate_point_delta") is not None
+                    else ""
+                )
+                + ")."
+            )
+        for item in (records.get("department_deltas") or [])[:5]:
+            lines.append(
+                f"- {item.get('department')}: {item.get('previous_absent_rows', 0)} → {item.get('latest_absent_rows', 0)} "
+                f"({item.get('absent_row_delta', 0):+d} rows"
+                + (
+                    f", {item.get('absent_rate_point_delta'):+.2f} pp"
+                    if item.get("absent_rate_point_delta") is not None
+                    else ""
+                )
+                + ")."
+            )
+        return "\n".join(lines), summary
     if records.get("focus") == "compare":
         lines = [note]
         for period in records.get("periods") or []:
@@ -1842,8 +2706,10 @@ def _org_attendance_text(records: dict, note: str) -> tuple[str, str]:
             lines.append(
                 f"{period.get('label')}: {period.get('start')} to {period.get('end')}. "
                 f"Present {counts.get('present', 0)}, remote {counts.get('remote', 0)}, absent {counts.get('absent', 0)}, "
+                f"distinct absent employees {counts.get('absent_employees', 0)}, "
                 f"sick {counts.get('sick', 0)}, leave {counts.get('leave', 0)}, hours {counts.get('hours', 0)}. "
-                f"The denominator is {counts.get('recorded_days', 0)} stored rows."
+                f"The denominator is {counts.get('recorded_days', 0)} stored rows "
+                f"(absent rate {counts.get('absent_rate_pct')}%)."
             )
         summary = "Attendance comparison from stored rows."
         return "\n".join(lines), summary

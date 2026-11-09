@@ -35,6 +35,16 @@ RRF_K = 60
 LEXICAL_POOL = 20
 DENSE_POOL = 20
 DENSE_FLOOR = 0.34
+RELATIVE_SCORE_FLOOR = 0.62
+# Synonym expansions improve paraphrase recall. They never invent policy answers.
+QUERY_EXPANSIONS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"\b(vacation|pto|p\.t\.o\.|paid time off|holiday leave|annual holiday)\b", re.I), " annual leave entitlement vacation PTO "),
+    (re.compile(r"\b(doctor'?s? note|physician(?:'s)? note|medical certificate)\b", re.I), " medical note sick leave "),
+    (re.compile(r"\b(work[-\s]?from[-\s]?home|wfh|telework)\b", re.I), " remote work remote days "),
+    (re.compile(r"\b(overtime premium|ot premium|extra pay(?: rate)?)\b", re.I), " overtime premium hours paid "),
+    (re.compile(r"\b(move teams?|change(?:d)? departments?|transfer(?:red)?)\b", re.I), " employee transfer approval routing "),
+    (re.compile(r"\b(people operations|hr) co-?approval\b", re.I), " People Operations co-approval leave "),
+)
 
 
 def tokenize(text: str) -> list[str]:
@@ -103,11 +113,18 @@ class BM25:
 
 
 def active_documents(db: Session, role: str, department: str | None, location: str | None) -> tuple[list[PolicyDocument], int]:
+    """Return only currently effective, non-superseded documents visible to the role.
+
+    Expired and superseded policies remain indexed for audit, but are excluded from
+    retrieval so they are never treated as current guidance.
+    """
     today = org_today()
     allowed = ACCESS_BY_ROLE.get(role, {"public"})
     rows = db.query(PolicyDocument).all()
     current = []
     for row in rows:
+        if row.status in {"expired", "superseded", "draft"}:
+            continue
         if row.status != "current":
             continue
         if row.effective_date > today:
@@ -115,6 +132,7 @@ def active_documents(db: Session, role: str, department: str | None, location: s
         if row.expiry_date and row.expiry_date < today:
             continue
         current.append(row)
+    # Any current document that supersedes another current slug wins; the older slug is withheld.
     superseded = {row.supersedes_slug for row in current if row.supersedes_slug}
     current = [row for row in current if row.slug not in superseded]
     withheld = 0
@@ -143,13 +161,28 @@ def retrieve(
     k: int = 4,
     embedder: Embedder | None = None,
 ) -> dict:
+    """Hybrid semantic + lexical retrieval over authorized, currently effective policies."""
     documents, withheld = active_documents(db, role, department, location)
     if not documents:
-        return _empty(withheld, "none", None, None)
+        return _empty(
+            withheld,
+            "none",
+            None,
+            None,
+            message="No currently effective policies are visible for this role.",
+        )
     by_id = {document.id: document for document in documents}
-    chunks = db.query(PolicyChunk).filter(PolicyChunk.policy_id.in_(list(by_id))).all()
+    allowed = ACCESS_BY_ROLE.get(role, {"public"})
+    raw_chunks = db.query(PolicyChunk).filter(PolicyChunk.policy_id.in_(list(by_id))).all()
+    chunks = _authorized_chunks(raw_chunks, by_id, allowed)
     if not chunks:
-        return _empty(withheld, "none", None, "No chunks are indexed for the visible policies.")
+        return _empty(
+            withheld,
+            "none",
+            None,
+            "No chunks are indexed for the visible policies.",
+            message="Visible policies are not indexed yet.",
+        )
     try:
         embedder = embedder or get_embedder()
     except EmbeddingUnavailable as exc:
@@ -174,11 +207,16 @@ def retrieve(
     dense_scores: dict[int, float] = {}
     dense_ids: list[int] = []
     mismatched = 0
+    query_vector: list[float] | None = None
     if embedder is None:
         retrieval_mode = "degraded_bm25"
     else:
         try:
             query_vector = embedder.embed_query(search_query)
+            if dimensions is not None and len(query_vector) != dimensions:
+                raise EmbeddingUnavailable(
+                    f"Query embedding returned {len(query_vector)} dimensions; expected {dimensions}."
+                )
         except EmbeddingUnavailable as exc:
             retrieval_mode = "degraded_bm25"
             embedding_error = str(exc)
@@ -207,15 +245,19 @@ def retrieve(
     rankings = [lexical_ids]
     if dense_ids:
         rankings.append(dense_ids)
-    if retrieval_mode == "hybrid" and not dense_scores and embedding_error:
+    if retrieval_mode == "hybrid" and not dense_ids and embedding_error:
         retrieval_mode = "degraded_bm25"
+    elif retrieval_mode == "hybrid" and not dense_ids and not lexical_ids:
+        retrieval_mode = "hybrid"
     fused = reciprocal_rank_fusion(rankings, k=RRF_K)
     chunk_by_id = {chunk.id: chunk for chunk in chunks}
     lexical_by_id = {chunks[index].id: lexical_scores[index] for index in range(len(chunks))}
 
     grouped: dict[int, dict] = {}
     for chunk_id, rrf_score in fused:
-        chunk = chunk_by_id[chunk_id]
+        chunk = chunk_by_id.get(chunk_id)
+        if chunk is None:
+            continue
         lexical = lexical_by_id.get(chunk_id, 0.0)
         semantic = dense_scores.get(chunk_id, 0.0)
         if lexical <= 0 and semantic < DENSE_FLOOR:
@@ -236,15 +278,18 @@ def retrieve(
             [],
             mismatched,
             0,
+            message="No sufficiently relevant policy passages matched this question.",
+            query_embedding_dimensions=len(query_vector) if query_vector is not None else None,
         )
     top_score = ordered[0]["score"] or 1.0
-    citations = [item for item in ordered if item["score"] >= top_score * 0.62][:k]
+    citations = [item for item in ordered if item["score"] >= top_score * RELATIVE_SCORE_FLOOR][:k]
     citations = _include_conflict_partners(citations, documents, chunks, top_score)
     for citation in citations:
         chunk = chunk_by_id.get(citation.get("chunk_id"))
         if chunk is not None:
             citation["excerpt"] = _excerpt(chunk.content, query=query)
     citations = _keep_supporting(query, citations)
+    citations = _dedupe_citations(citations)
     for citation in citations:
         citation["score"] = round(citation["score"], 4)
         citation["lexical_score"] = round(citation["lexical_score"], 4)
@@ -258,6 +303,11 @@ def retrieve(
             citations = [item for _, item in sorted(zip(scores, citations), key=lambda pair: -pair[0])]
             for item, score in zip(citations, sorted(scores, reverse=True)):
                 item["rerank_score"] = round(score, 4)
+    message = None
+    if not citations:
+        message = "No sufficiently relevant policy passages matched this question."
+        if embedding_error:
+            message += f" Dense retrieval was unavailable: {embedding_error}"
     return _result(
         confidence,
         withheld,
@@ -269,6 +319,8 @@ def retrieve(
         mismatched,
         round(top_score, 4),
         rerank_status,
+        message=message,
+        query_embedding_dimensions=len(query_vector) if query_vector is not None else None,
     )
 
 
@@ -325,24 +377,87 @@ def _document_owner(document: PolicyDocument) -> str:
     return ""
 
 
+def _authorized_chunks(
+    chunks: list[PolicyChunk],
+    by_id: dict[int, PolicyDocument],
+    allowed: set[str],
+) -> list[PolicyChunk]:
+    """Defense-in-depth: drop chunks whose stored access metadata is outside the role."""
+    visible: list[PolicyChunk] = []
+    for chunk in chunks:
+        document = by_id.get(chunk.policy_id)
+        if document is None:
+            continue
+        meta_access = (chunk.meta_json or {}).get("access") or document.access
+        if meta_access not in allowed:
+            continue
+        visible.append(chunk)
+    return visible
+
+
 def _citation(document: PolicyDocument, chunk: PolicyChunk, score: float, lexical: float, semantic: float) -> dict:
+    meta = chunk.meta_json or {}
     return {
         "score": score,
         "lexical_score": lexical,
         "semantic_score": semantic,
         "policy_id": document.slug,
+        "document_id": document.id,
         "title": document.title,
         "version": document.version,
         "doc_type": document.doc_type,
         "effective_date": document.effective_date.isoformat(),
+        "expiration_date": document.expiry_date.isoformat() if document.expiry_date else None,
         "status": document.status,
         "access": document.access,
+        "visibility": meta.get("visibility") or ("hr_admin" if document.access == "hr_confidential" else "authenticated"),
         "conflict_group": document.conflict_group,
         "department": document.department,
+        "source": meta.get("source") or document.source_path,
         "owner": _document_owner(document),
         "excerpt": _excerpt(chunk.content),
         "chunk_id": chunk.id,
+        "chunk_index": chunk.chunk_index,
     }
+
+
+def _dedupe_citations(citations: list[dict]) -> list[dict]:
+    """Remove duplicate policy rows and near-identical excerpts."""
+    kept: list[dict] = []
+    seen_policies: set[str] = set()
+    seen_excerpts: set[str] = set()
+    for item in citations:
+        policy_id = item.get("policy_id") or ""
+        excerpt_key = re.sub(r"\W+", " ", (item.get("excerpt") or "").lower()).strip()[:180]
+        if policy_id in seen_policies:
+            continue
+        if excerpt_key and excerpt_key in seen_excerpts:
+            continue
+        seen_policies.add(policy_id)
+        if excerpt_key:
+            seen_excerpts.add(excerpt_key)
+        kept.append(item)
+    return kept
+
+
+def context_for_llm(result: dict) -> list[dict]:
+    """Compact grounded passages for the next orchestration / composition stage."""
+    passages = []
+    for item in result.get("citations") or []:
+        passages.append(
+            {
+                "policy_id": item.get("policy_id"),
+                "title": item.get("title"),
+                "version": item.get("version"),
+                "effective_date": item.get("effective_date"),
+                "source": item.get("source"),
+                "access": item.get("access"),
+                "excerpt": item.get("excerpt"),
+                "chunk_id": item.get("chunk_id"),
+            }
+        )
+    return passages
+
 
 
 def _include_conflict_partners(
@@ -387,15 +502,32 @@ GENERIC_TOPIC = STOPWORDS | {
     "using", "used", "about", "does", "each", "per", "into", "over", "than",
     "before", "after", "during", "without", "within", "their", "them", "your",
     "have", "has", "had", "not", "may", "can", "will", "would", "should",
+    "allotment", "amount", "number", "how", "long", "often",
+}
+
+
+_SUPPORT_ALIASES = {
+    "vacation": ("annual", "leave", "entitlement", "entitled"),
+    "pto": ("annual", "leave", "entitlement", "entitled"),
+    "holiday": ("annual", "leave", "notice"),
+    "doctor": ("medical", "note", "sick"),
+    "physicians": ("medical", "note", "sick"),
+    "physician": ("medical", "note", "sick"),
+    "wfh": ("remote", "work", "days"),
+    "telework": ("remote", "work", "days"),
 }
 
 
 def _focus_tokens(query: str) -> list[str]:
     seen = []
     for token in tokenize(query):
-        if token in GENERIC_TOPIC or token in seen:
+        if token in GENERIC_TOPIC:
             continue
-        seen.append(token)
+        candidates = _SUPPORT_ALIASES.get(token, (token,))
+        for item in candidates:
+            if item in GENERIC_TOPIC or item in seen:
+                continue
+            seen.append(item)
     return seen
 
 
@@ -415,17 +547,21 @@ _REQUIRED_TOPICS = (
 
 
 def _expanded_search(query: str) -> str:
-    """Add settlement vocabulary to the search text without changing the question used for support."""
+    """Expand paraphrase vocabulary for embedding/BM25 without changing answer generation."""
+    expanded = query
+    for pattern, addition in QUERY_EXPANSIONS:
+        if pattern.search(query):
+            expanded = f"{expanded} {addition}"
     if re.search(r"\bnotice\b", query, re.IGNORECASE) and not re.search(
         r"unused|encash|settlement", query, re.IGNORECASE
     ):
-        return query
+        return expanded
     if re.search(r"resign|resignation|terminat|encash|settlement", query, re.IGNORECASE):
         return (
-            query
+            expanded
             + " resignation termination final settlement leave encashment unused leave provisions"
         )
-    return query
+    return expanded
 
 
 def _missing_required_topic(query: str, citations: list[dict]) -> bool:
@@ -465,6 +601,10 @@ def _keep_supporting(query: str, citations: list[dict]) -> list[dict]:
         if _missing_required_topic(query, kept):
             return []
         return kept
+    # Distinctive query terms that never appear in any excerpt are treated as no-result,
+    # instead of passing an unrelated high-semantic neighbor to the composer.
+    if focus:
+        return []
     ranked = sorted(
         citations,
         key=lambda item: (item.get("semantic_score") or 0.0, item.get("lexical_score") or 0.0, item.get("score") or 0.0),
@@ -544,8 +684,26 @@ def _excerpt(content: str, limit: int = 320, query: str = "") -> str:
     return compact[: limit - 1].rstrip() + "…"
 
 
-def _empty(withheld: int, mode: str, model: str | None, error: str | None) -> dict:
-    return _result("weak", withheld, mode, model, error, [], [], 0, 0)
+def _empty(
+    withheld: int,
+    mode: str,
+    model: str | None,
+    error: str | None,
+    *,
+    message: str | None = None,
+) -> dict:
+    return _result(
+        "weak",
+        withheld,
+        mode,
+        model,
+        error,
+        [],
+        [],
+        0,
+        0,
+        message=message or "No relevant policy passages were retrieved.",
+    )
 
 
 def _result(
@@ -559,8 +717,11 @@ def _result(
     mismatched: int,
     top_score: float,
     rerank_status: str = "disabled",
+    *,
+    message: str | None = None,
+    query_embedding_dimensions: int | None = None,
 ) -> dict:
-    return {
+    payload = {
         "confidence": confidence,
         "withheld_documents": withheld,
         "retrieval_mode": mode,
@@ -572,7 +733,11 @@ def _result(
         "citations": citations,
         "conflicts": conflicts,
         "top_score": top_score,
+        "message": message,
+        "query_embedding_dimensions": query_embedding_dimensions,
+        "context": context_for_llm({"citations": citations}),
     }
+    return payload
 
 
 def conflict_groups_in_force(db: Session) -> dict[str, list[str]]:

@@ -272,15 +272,41 @@ def out_of_hierarchy_request(message: str) -> bool:
 def organization_wide_request(message: str) -> bool:
     """True when the current message explicitly asks for organization-wide scope."""
     text = message.lower()
-    return bool(
+    team_framed = bool(
         re.search(
-            r"\b(organization-wide|organisation-wide|company-wide|across (?:the )?(?:organization|organisation|company|northstar)|"
-            r"entire (?:organization|organisation|company|directory|database|northstar|employee(?:\s+database|\s+directory|\s+records?)?)|"
-            r"complete (?:hr|employee) (?:database|directory|records?)|"
-            r"all employees|every employee|everyone in the (?:organization|organisation|company)|"
-            r"(?:every|all) departments?(?:\s+in\s+(?:northstar|the\s+(?:company|organi[sz]ation)))?|"
-            r"cover (?:every|all) departments?|"
-            r"across (?:all )?departments?)\b",
+            r"\b(my team|direct reports?|reports? i manage|team(?:'s)? (?:attendance|absence|leave)|"
+            r"among (?:my|the) (?:reports?|team))\b",
             text,
         )
     )
+    explicit_org = bool(
+        re.search(
+            r"\b("
+            r"organization-wide|organisation-wide|company-wide|"
+            r"across (?:the )?(?:organization|organisation|company|northstar)|"
+            r"(?:whole|entire) (?:organization|organisation|company|directory|database|northstar|"
+            r"employee(?:\s+database|\s+directory|\s+records?)?)|"
+            r"complete (?:hr|employee) (?:database|directory|records?)|"
+            r"all employees|every employee|"
+            r"everyone in the (?:organization|organisation|company)|"
+            r"(?:every|all) departments?(?:\s+in\s+(?:northstar|the\s+(?:company|organi[sz]ation)))?|"
+            r"cover (?:every|all) departments?|"
+            r"across (?:all )?departments?"
+            r")\b",
+            text,
+        )
+    )
+    # "workforce/absence statistics for everyone" is org-wide unless the ask is team-framed.
+    everyone_org = bool(
+        re.search(
+            r"\b("
+            r"(?:workforce|analytics|statistics|absence|absenteeism|attendance|report).{0,40}\b(?:for |across )?everyone\b|"
+            r"\beveryone\b.{0,40}\b(?:workforce|analytics|statistics|organization|organisation|company)\b|"
+            r"(?:for|across) everyone"
+            r")\b",
+            text,
+        )
+    )
+    if team_framed and not explicit_org:
+        return False
+    return explicit_org or everyone_org

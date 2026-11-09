@@ -21,7 +21,7 @@ from app.models import (
     Project,
     User,
 )
-from app.services.records import attendance_window, parse_comparison
+from app.services.records import attendance_window, parse_comparison, parse_named_month_periods
 
 PAGE = 25
 OPEN_LEAVE = ("pending_manager", "pending_hr", "approved")
@@ -147,6 +147,10 @@ def _context(subject: str, user_id: int, employee_id: int, **extra) -> dict:
     }
     if extra.get("hire_filter"):
         payload["hire_filter"] = extra["hire_filter"]
+    if extra.get("prior_window"):
+        payload["prior_window"] = extra["prior_window"]
+    if extra.get("focus"):
+        payload["focus"] = extra["focus"]
     return payload
 
 
@@ -975,26 +979,215 @@ def _directory(db: Session, message: str, inherited: dict | None, target_ids: li
 def _counts(rows: list[Attendance]) -> dict:
     counts = {"present": 0, "remote": 0, "absent": 0, "sick": 0, "leave": 0, "late": 0}
     hours = 0.0
+    absent_employees: set[int] = set()
     for row in rows:
         if row.status in counts:
             counts[row.status] += 1
+        if row.status == "absent":
+            absent_employees.add(row.employee_id)
         hours += float(row.hours or 0)
     recorded = len(rows)
     worked = counts["present"] + counts["remote"] + counts["late"]
+    absent_rate = round(100 * counts["absent"] / recorded, 2) if recorded else None
     return {
         **counts,
         "recorded_days": recorded,
         "hours": int(hours) if hours.is_integer() else round(hours, 2),
         "attendance_percentage": round(100 * worked / recorded, 1) if recorded else None,
+        "absent_employees": len(absent_employees),
+        "absent_rate_pct": absent_rate,
+    }
+
+
+def _period_snapshot(db: Session, employees: list[Employee], start: date, end: date, label: str) -> dict:
+    ids = [row.id for row in employees]
+    rows = _attendance_rows(db, ids, start, end)
+    counts = _counts(rows)
+    departments = {row.id: row.name for row in db.query(Department).all()}
+    by_dept_rows: dict[str, list[Attendance]] = defaultdict(list)
+    emp_dept = {row.id: departments.get(row.department_id, "") for row in employees}
+    for row in rows:
+        dept_name = emp_dept.get(row.employee_id)
+        if dept_name:
+            by_dept_rows[dept_name].append(row)
+    dept_stats = []
+    for dept_name in sorted(departments.values()):
+        dept_rows = by_dept_rows.get(dept_name) or []
+        dept_counts = _counts(dept_rows)
+        dept_stats.append(
+            {
+                "department": dept_name,
+                "absent_rows": dept_counts.get("absent", 0),
+                "absent_employees": dept_counts.get("absent_employees", 0),
+                "recorded_days": dept_counts.get("recorded_days", 0),
+                "absent_rate_pct": dept_counts.get("absent_rate_pct"),
+            }
+        )
+    return {
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+        "label": label,
+        "counts": counts,
+        "departments": dept_stats,
     }
 
 
 def _attendance(db: Session, message: str, inherited: dict | None) -> tuple[dict, dict]:
     today = org_today()
     text = message.lower()
+    inherited = inherited or {}
     department = _department_for(db, message, inherited)
     employees = db.query(Employee).filter(Employee.employment_status == "active").all()
     named_departments = _named_departments(db, message)
+    # Multi-turn: "What about October?" / "How much did it increase?" / "Which department contributed most?"
+    # Keep org_attendance deterministic instead of inventing workforce-analytics figures.
+    prior_start = inherited.get("start")
+    prior_end = inherited.get("end")
+    asks_increase = bool(
+        re.search(
+            r"\b(how much did .{0,60} increase|did .{0,40} increase|percentage change|"
+            r"percent(?:age)?[- ]?point|increase from .{0,40} to)\b",
+            text,
+        )
+    )
+    asks_department_contrib = bool(
+        re.search(
+            r"\b("
+            r"which department contributed most|department contributed|contributed most|"
+            r"largest (?:increase|contribution)|department had the largest increase|"
+            r"which department .{0,40}(?:increase|delta|change)|department .{0,20}most"
+            r")\b",
+            text,
+        )
+    )
+    named_months = parse_named_month_periods(message, today)
+    month_switch = bool(named_months) and bool(prior_start) and bool(
+        re.search(r"\b(what about|how about|and)\b", text) or len(text.split()) <= 6
+    )
+    if (
+        (inherited.get("subject") == "org_attendance" or asks_increase or asks_department_contrib)
+        and (asks_increase or asks_department_contrib or month_switch)
+        and (prior_start and prior_end or len(named_months) >= 2)
+    ):
+        prev_start = prev_end = None
+        cur_start = cur_end = None
+        cur_label = ""
+        prev_label = inherited.get("label") or ""
+        if len(named_months) >= 2:
+            prev_start, prev_end, prev_label = named_months[0]
+            cur_start, cur_end, cur_label = named_months[1]
+        elif named_months and prior_start and prior_end:
+            try:
+                prev_start = date.fromisoformat(str(prior_start)[:10])
+                prev_end = date.fromisoformat(str(prior_end)[:10])
+                prev_label = inherited.get("label") or prev_start.strftime("%B %Y")
+            except Exception:
+                prev_start = prev_end = None
+            cur_start, cur_end, cur_label = named_months[0]
+        elif prior_start and prior_end:
+            prior_window = inherited.get("prior_window") or {}
+            # Prefer stored prior_window (e.g. September) vs current window (e.g. October).
+            if prior_window.get("start") and prior_window.get("end") and (asks_increase or asks_department_contrib):
+                try:
+                    prev_start = date.fromisoformat(str(prior_window["start"])[:10])
+                    prev_end = date.fromisoformat(str(prior_window["end"])[:10])
+                    prev_label = prior_window.get("label") or prev_start.strftime("%B %Y")
+                    cur_start = date.fromisoformat(str(prior_start)[:10])
+                    cur_end = date.fromisoformat(str(prior_end)[:10])
+                    cur_label = inherited.get("label") or cur_start.strftime("%B %Y")
+                except Exception:
+                    prev_start = prev_end = None
+            else:
+                try:
+                    prev_start = date.fromisoformat(str(prior_start)[:10])
+                    prev_end = date.fromisoformat(str(prior_end)[:10])
+                    prev_label = inherited.get("label") or prev_start.strftime("%B %Y")
+                except Exception:
+                    prev_start = prev_end = None
+                cur_start, cur_end, cur_label = attendance_window(message, today, inherited, subject="org_attendance")
+        if prev_start and prev_end and cur_start and cur_end:
+            previous = _period_snapshot(db, employees, prev_start, prev_end, prev_label)
+            latest = _period_snapshot(db, employees, cur_start, cur_end, cur_label)
+            prev_c = previous["counts"]
+            lat_c = latest["counts"]
+            abs_row_delta = int(lat_c.get("absent", 0) - prev_c.get("absent", 0))
+            abs_emp_delta = int(lat_c.get("absent_employees", 0) - prev_c.get("absent_employees", 0))
+            prev_rate = prev_c.get("absent_rate_pct")
+            lat_rate = lat_c.get("absent_rate_pct")
+            point_delta = None if prev_rate is None or lat_rate is None else round(lat_rate - prev_rate, 2)
+            pct_change = None
+            if prev_c.get("absent"):
+                pct_change = round(100 * abs_row_delta / prev_c["absent"], 2)
+            dept_deltas = []
+            prev_by = {item["department"]: item for item in previous["departments"]}
+            for item in latest["departments"]:
+                before = prev_by.get(item["department"]) or {}
+                row_delta = int(item.get("absent_rows", 0) - before.get("absent_rows", 0))
+                rate_before = before.get("absent_rate_pct")
+                rate_after = item.get("absent_rate_pct")
+                dept_deltas.append(
+                    {
+                        "department": item["department"],
+                        "previous_absent_rows": before.get("absent_rows", 0),
+                        "latest_absent_rows": item.get("absent_rows", 0),
+                        "absent_row_delta": row_delta,
+                        "previous_absent_rate_pct": rate_before,
+                        "latest_absent_rate_pct": rate_after,
+                        "absent_rate_point_delta": None
+                        if rate_before is None or rate_after is None
+                        else round(rate_after - rate_before, 2),
+                    }
+                )
+            dept_deltas.sort(key=lambda item: (-item["absent_row_delta"], item["department"]))
+            focus = "department_contribution" if asks_department_contrib else "period_change" if asks_increase or month_switch else "period_change"
+            if month_switch and not asks_increase and not asks_department_contrib:
+                focus = "period_switch"
+            payload = {
+                "kind": "org_attendance",
+                "focus": focus,
+                "department": "",
+                "employee_count": len(employees),
+                "start": latest["start"],
+                "end": latest["end"],
+                "label": latest["label"],
+                "counts": lat_c,
+                "previous": previous,
+                "latest": latest,
+                "change": {
+                    "absent_row_delta": abs_row_delta,
+                    "absent_employee_delta": abs_emp_delta,
+                    "absent_row_percent_change": pct_change,
+                    "absent_rate_point_delta": point_delta,
+                    "previous_absent_rows": prev_c.get("absent", 0),
+                    "latest_absent_rows": lat_c.get("absent", 0),
+                    "previous_absent_employees": prev_c.get("absent_employees", 0),
+                    "latest_absent_employees": lat_c.get("absent_employees", 0),
+                    "previous_absent_rate_pct": prev_rate,
+                    "latest_absent_rate_pct": lat_rate,
+                },
+                "department_deltas": dept_deltas,
+                "top_department": dept_deltas[0] if dept_deltas else None,
+                "note": (
+                    "Absent rows are attendance.status='absent'. Distinct absent employees are unique employee_id values "
+                    "with at least one absent row. Percentage change uses absent rows: "
+                    "100 * (latest - previous) / previous. Percentage-point change uses absent_rate_pct = "
+                    "100 * absent_rows / recorded_rows for each period (latest rate minus previous rate)."
+                ),
+            }
+            return payload, _context(
+                "org_attendance",
+                0,
+                0,
+                start=latest["start"],
+                end=latest["end"],
+                label=latest["label"],
+                prior_window={
+                    "start": previous["start"],
+                    "end": previous["end"],
+                    "label": previous["label"],
+                    "counts": previous["counts"],
+                },
+            )
     # Department average recorded hours (previous calendar month / last month).
     if re.search(r"\b(average|avg|mean)\b", text) and re.search(r"\b(working )?hours\b", text) and re.search(
         r"\b(department|departments|every department)\b", text
@@ -1222,6 +1415,13 @@ def _attendance(db: Session, message: str, inherited: dict | None) -> tuple[dict
                     "attendance_percentage": counts.get("attendance_percentage"),
                 }
             )
+    counts = _counts(rows)
+    if (
+        focus == "summary"
+        and re.search(r"\b(how many|number of|count)\b", text)
+        and re.search(r"\b(employees? were absent|employees? absent|people were absent|absent employees?)\b", text)
+    ):
+        focus = "absent_employees"
     payload = {
         "kind": "org_attendance",
         "focus": focus,
@@ -1230,7 +1430,7 @@ def _attendance(db: Session, message: str, inherited: dict | None) -> tuple[dict
         "start": start.isoformat(),
         "end": end.isoformat(),
         "label": label,
-        "counts": _counts(rows),
+        "counts": counts,
         "departments": department_rows,
         "people": ranked[:PAGE],
         "people_count": payload_count if focus == "remote" else len(ranked),
@@ -1238,13 +1438,21 @@ def _attendance(db: Session, message: str, inherited: dict | None) -> tuple[dict
         "absence_filter": "more than three" if "more than three" in text else "",
         "note": (
             "Absences are stored attendance rows with status absent. Missing rows, weekends, and holidays are not counted as absences. "
-            "Attendance percentage = (present + remote + late) / stored attendance rows in the window."
-            if focus == "department_summary"
+            "Attendance percentage = (present + remote + late) / stored attendance rows in the window. "
+            "Distinct absent employees are unique employee_id values with at least one absent row."
+            if focus in {"department_summary", "absent_employees"}
             else "Absences are stored attendance rows with status absent. Missing rows, weekends, and holidays are not counted as absences."
         ),
     }
     return payload, _context(
-        "org_attendance", 0, 0, department=payload["department"], start=start.isoformat(), end=end.isoformat(), label=label
+        "org_attendance",
+        0,
+        0,
+        department=payload["department"],
+        start=start.isoformat(),
+        end=end.isoformat(),
+        label=label,
+        focus=focus,
     )
 
 

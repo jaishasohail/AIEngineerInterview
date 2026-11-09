@@ -2,11 +2,31 @@
 
 from sqlalchemy.orm import Session
 
-from app.models import Employee, User
+from app.models import Approval, Employee, User
 
 SENSITIVE_SALARY = "salary"
 SENSITIVE_PERFORMANCE = "performance"
 SENSITIVE_PERSONAL = "personal"
+SENSITIVE_ATTENDANCE = "attendance"
+
+# Arguments an LLM tool call must never be allowed to override.
+FORBIDDEN_TOOL_ARG_KEYS = frozenset(
+    {
+        "employee_id",
+        "user_id",
+        "actor_user_id",
+        "owner_user_id",
+        "role",
+        "actor_role",
+        "access_token",
+        "password",
+        "jwt",
+        "api_key",
+        "secret",
+        "conversation_id",
+        "pending_action_id",
+    }
+)
 
 
 class AuthorizationError(Exception):
@@ -41,6 +61,71 @@ def is_manager_of(db: Session, manager: Employee, subject: Employee) -> bool:
 def direct_report_ids(db: Session, manager_id: int) -> list[int]:
     rows = db.query(Employee.id).filter(Employee.manager_id == manager_id).all()
     return [row[0] for row in rows]
+
+
+def sanitize_tool_arguments(arguments: dict | None) -> dict:
+    """Drop identity/privilege keys from LLM-supplied tool arguments."""
+    if not arguments:
+        return {}
+    cleaned: dict = {}
+    for key, value in arguments.items():
+        if str(key).lower() in FORBIDDEN_TOOL_ARG_KEYS:
+            continue
+        cleaned[key] = value
+    return cleaned
+
+
+def can_view_employee_record(db: Session, actor: User, actor_employee: Employee, subject: Employee) -> bool:
+    """Private employee profile access (not the public directory card)."""
+    if actor.role == "hr_admin" or actor.employee_id == subject.id:
+        return True
+    if actor.role == "manager" and is_manager_of(db, actor_employee, subject):
+        return True
+    return False
+
+
+def can_view_attendance(db: Session, actor: User, actor_employee: Employee, subject: Employee) -> bool:
+    if actor.role == "hr_admin" or actor.employee_id == subject.id:
+        return True
+    if actor.role == "manager" and is_manager_of(db, actor_employee, subject):
+        return True
+    return False
+
+
+def can_decide_approval(actor: User, approval: Approval) -> bool:
+    """Deterministic approver check — never trust the model for this.
+
+    Rules (API, chatbot authorize, tools, and confirmation all share this):
+    - Employees never approve or reject (including their own leave).
+    - Nobody may decide an approval where they are the subject employee.
+    - HR Admin may decide HR-stage items and may override manager-stage leave decisions.
+    - Managers may only decide items assigned to them as approver_employee_id.
+    """
+    if actor.role == "employee":
+        return False
+    if approval.subject_employee_id and actor.employee_id == approval.subject_employee_id:
+        return False
+    if approval.approver_role == "hr_admin":
+        return actor.role == "hr_admin"
+    if actor.role == "hr_admin":
+        return True
+    if actor.role != "manager":
+        return False
+    return actor.employee_id is not None and actor.employee_id == approval.approver_employee_id
+
+
+def scoped_employee_ids(db: Session, actor: User, actor_employee: Employee) -> list[int] | None:
+    """Employee ids visible for attendance/analytics aggregates.
+
+    None means organization-wide (HR Admin only).
+    """
+    if actor.role == "hr_admin":
+        return None
+    if actor.role == "manager":
+        # Manager analytics/attendance aggregates are limited to authorized direct reports.
+        # Do not include the manager's own id in the aggregate scope.
+        return sorted(direct_report_ids(db, actor_employee.id))
+    return [actor_employee.id]
 
 
 def can_view_directory(actor: User, _subject: Employee) -> bool:
@@ -166,4 +251,24 @@ def assert_sensitive_access(
             "You are not allowed to view that employee's personal contact details.",
             resource=f"employee:{subject.id}",
             action="read_personal",
+        )
+    if SENSITIVE_ATTENDANCE in kinds and not can_view_attendance(db, actor, actor_employee, subject):
+        raise AuthorizationError(
+            "You are not allowed to view that employee's attendance records.",
+            resource=f"employee:{subject.id}",
+            action="read_attendance",
+        )
+
+
+def assert_employee_record_access(
+    db: Session,
+    actor: User,
+    actor_employee: Employee,
+    subject: Employee,
+) -> None:
+    if not can_view_employee_record(db, actor, actor_employee, subject):
+        raise AuthorizationError(
+            "You cannot open that employee record.",
+            resource=f"employee:{subject.id}",
+            action="read",
         )

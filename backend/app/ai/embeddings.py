@@ -145,6 +145,8 @@ def get_embedder() -> Embedder:
         settings.embedding_model,
         settings.embedding_dimensions,
         settings.embedding_base_url,
+        settings.embedding_api_key,
+        settings.embedding_timeout_seconds,
     )
     if _embedder is not None and _signature == signature:
         return _embedder
@@ -163,10 +165,34 @@ def get_embedder() -> Embedder:
         raise EmbeddingUnavailable(
             f"Unknown EMBEDDING_PROVIDER '{settings.embedding_provider}'. Use local or openai_compatible."
         )
+    validate_embedder(embedder)
     _embedder = embedder
     _signature = signature
     logger.info("Embedding provider ready: %s %s (%s dimensions)", embedder.provider, embedder.model_id, embedder.dimensions)
     return embedder
+
+
+def validate_embedder(embedder: Embedder, *, probe: bool = True) -> None:
+    """Fail fast when the configured model cannot produce the configured vector size."""
+    settings = get_settings()
+    if embedder.dimensions != settings.embedding_dimensions:
+        raise EmbeddingUnavailable(
+            f"Embedder dimensions {embedder.dimensions} do not match EMBEDDING_DIMENSIONS={settings.embedding_dimensions}."
+        )
+    if embedder.model_id != settings.embedding_model:
+        raise EmbeddingUnavailable(
+            f"Embedder model {embedder.model_id} does not match EMBEDDING_MODEL={settings.embedding_model}."
+        )
+    if not probe:
+        return
+    sample = embedder.embed_query("helios embedding dimension probe")
+    if len(sample) != embedder.dimensions:
+        raise EmbeddingUnavailable(
+            f"Embedding probe returned {len(sample)} dimensions; expected {embedder.dimensions}."
+        )
+    norm = math.sqrt(sum(value * value for value in sample))
+    if norm <= 0:
+        raise EmbeddingUnavailable("Embedding probe returned a zero vector.")
 
 
 def reset_embedder() -> None:

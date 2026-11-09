@@ -1949,10 +1949,47 @@ def leave_status_report(
         and re.search(r"\b(it|that|who approved)\b", text)
         and not re.search(r"\b(other|all|pending|history|latest|most recent)\b", text)
     )
-    if re.search(r"\bno approval\b", text) or (
+    from app.ai.context import delayed_approval_advice_question
+
+    inherited_delayed = bool(
+        inherited
+        and inherited.get("focus") in {"delayed_approval", "pending", "latest"}
+        and re.search(
+            r"\b(how long|pending|approve|approver|respond|follow up|next steps?|still|which request|what if)\b",
+            text,
+        )
+    )
+    if delayed_approval_advice_question(text) or inherited_delayed or (
+        re.search(
+            r"\b("
+            r"manager has not approved|has(?:n'?t| not) (?:been )?approved|"
+            r"still (?:waiting|pending|awaiting)|waiting (?:for|on) (?:my )?(?:manager|approval|decision)|"
+            r"still awaiting approval|awaiting approval|"
+            r"pending for (?:several |a few |\d+ )?days|"
+            r"(?:my )?leave (?:has )?been pending|leave request still|"
+            r"approval (?:is|has been) delayed|delayed approval|"
+            r"what should i do|can you advise|who needs to approve|"
+            r"if (?:my )?manager doesn'?t respond|"
+            r"why .{0,40}(?:still )?(?:pending|awaiting)"
+            r")\b",
+            text,
+        )
+        and re.search(r"\b(leave|request|manager|approval|pending)\b", text)
+        and not re.search(r"\b(submit|book|apply for|prepare|create|draft|file)\b", text)
+    ):
+        report_filter = "delayed_approval"
+        rows = (
+            base.filter(LeaveRequest.status.in_(("pending_manager", "pending_hr")))
+            .order_by(LeaveRequest.submitted_at.asc(), LeaveRequest.id.asc())
+            .limit(100)
+            .all()
+        )
+        approvals = _approval_details(db, [row.id for row in rows])
+    elif re.search(r"\bno approval\b", text) or (
         re.search(r"\bapproved\b", text)
         and re.search(r"\b(no|without|missing)\b", text)
         and re.search(r"\b(approval|decision)\b", text)
+        and not re.search(r"\bhas not approved\b", text)
     ):
         report_filter = "approved_without_decision"
         approved_rows = (
@@ -1990,7 +2027,17 @@ def leave_status_report(
             query = query.filter(LeaveRequest.id != int(inherited_id))
         rows = query.order_by(LeaveRequest.submitted_at.desc(), LeaveRequest.id.desc()).limit(100).all()
         approvals = _approval_details(db, [row.id for row in rows])
-    elif re.search(r"\b(pending|waiting for a decision|awaiting (?:a |an )?decision)\b", text):
+    elif re.search(
+        r"\b("
+        r"pending|"
+        r"waiting for a decision|"
+        r"awaiting (?:a |an )?decision|"
+        r"awaiting approval|"
+        r"waiting (?:for|on) approval|"
+        r"awaiting (?:manager|hr) approval"
+        r")\b",
+        text,
+    ):
         report_filter = "pending"
         rows = (
             base.filter(LeaveRequest.status.in_(("pending_manager", "pending_hr")))
@@ -2043,8 +2090,30 @@ def leave_status_report(
     for row in rows:
         by_status[row.status] = by_status.get(row.status, 0) + 1
     pending_n = sum(n for status, n in by_status.items() if "pending" in status)
+    actor = db.get(Employee, employee_id)
+    approval_manager = None
+    if actor is not None and actor.approval_manager_id:
+        approval_manager = db.get(Employee, actor.approval_manager_id)
+    advice = None
+    if report_filter == "delayed_approval":
+        advice = {
+            "process": [
+                "Leave requests first wait in pending_manager for the approval manager on your employee record.",
+                "If the request is longer than 10 business days or touches a critical project deadline, "
+                "People Operations co-approval (pending_hr) is also required after the manager decision.",
+                "The assistant cannot approve, reject, or escalate leave on your behalf.",
+            ],
+            "next_steps": [
+                "Follow up politely with your assigned approval manager about the pending request id(s).",
+                "Confirm the leave dates and any coverage plan so the manager can decide.",
+                "If the request has moved to pending_hr, contact People Operations after your manager has decided.",
+                "Do not submit a duplicate leave request unless you intentionally want a new request.",
+            ],
+            "approval_manager": None if approval_manager is None else approval_manager.full_name,
+        }
     return {
         "kind": "leave_request_status",
+        "focus": "delayed_approval" if report_filter == "delayed_approval" else report_filter,
         "employee_id": employee_id,
         "timezone": org_timezone_name(),
         "as_of": today.isoformat(),
@@ -2052,6 +2121,7 @@ def leave_status_report(
         "question": question,
         "request_count": request_count,
         "changed": False,
+        "advice": advice,
         "by_status": {
             "approved": by_status.get("approved", 0),
             "rejected": by_status.get("rejected", 0),
@@ -2103,6 +2173,10 @@ def parse_leave_dates(message: str, today: date | None = None) -> dict | None:
         start = date(int(iso[0][0]), int(iso[0][1]), int(iso[0][2]))
         end = date(int(iso[1][0]), int(iso[1][1]), int(iso[1][2]))
         return _pack(start, end)
+    # Single ISO date: "... for 2026-12-28" / "on 2026-12-28"
+    if len(iso) == 1:
+        start = date(int(iso[0][0]), int(iso[0][1]), int(iso[0][2]))
+        return _pack(start, None)
 
     # Month-first same-month span: December 7-18, 2026 / December 7 to 18, 2026
     same_month = re.search(
@@ -2259,8 +2333,20 @@ def profile_report(
         "job_title": employee.job_title,
         "department": department_name,
         "location": employee.location,
+        "manager_id": employee.manager_id,
         "manager": None if manager is None else manager.full_name,
+        "approval_manager_id": employee.approval_manager_id,
         "approval_manager": None if approval is None else approval.full_name,
+        "department_id": employee.department_id,
+        "routing_consistent": (
+            employee.department_id is not None
+            and employee.manager_id is not None
+            and employee.approval_manager_id is not None
+            and employee.manager_id == employee.approval_manager_id
+            and manager is not None
+            and approval is not None
+            and department is not None
+        ),
         "hire_date": employee.hire_date.isoformat() if employee.hire_date else None,
         "employment_status": employee.employment_status,
         "grade": employee.grade,

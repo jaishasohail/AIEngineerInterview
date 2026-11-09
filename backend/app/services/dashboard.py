@@ -3,7 +3,7 @@ from datetime import timedelta
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from app.access import employee_for_user
+from app.access import direct_report_ids, employee_for_user, scoped_employee_ids
 from app.clock import org_today
 from app.models import Approval, Attendance, Department, Employee, LeaveRequest, User
 
@@ -12,14 +12,16 @@ def build_dashboard(db: Session, actor: User) -> dict:
     today = org_today()
     horizon = today + timedelta(days=14)
     actor_employee = employee_for_user(db, actor)
-    employee_query = db.query(Employee).filter(Employee.employment_status == "active")
-    if actor.role == "manager":
-        employee_query = employee_query.filter(Employee.department_id == actor_employee.department_id)
-    elif actor.role == "employee":
-        employee_query = employee_query.filter(Employee.department_id == actor_employee.department_id)
-    visible_employees = employee_query.all()
-    visible_ids = [person.id for person in visible_employees]
-    headcount = len(visible_ids) if actor.role != "hr_admin" else db.query(Employee).filter(Employee.employment_status == "active").count()
+    scoped_ids = scoped_employee_ids(db, actor, actor_employee)
+    if scoped_ids is None:
+        visible_ids = [row[0] for row in db.query(Employee.id).filter(Employee.employment_status == "active").all()]
+    else:
+        visible_ids = list(scoped_ids)
+    headcount = (
+        db.query(Employee).filter(Employee.employment_status == "active").count()
+        if actor.role == "hr_admin"
+        else len(visible_ids)
+    )
 
     leave_query = db.query(LeaveRequest).filter(
         LeaveRequest.status == "approved",
@@ -27,7 +29,7 @@ def build_dashboard(db: Session, actor: User) -> dict:
         LeaveRequest.end_date >= today,
     )
     if actor.role == "manager":
-        report_ids = [row[0] for row in db.query(Employee.id).filter(Employee.manager_id == actor_employee.id).all()]
+        report_ids = direct_report_ids(db, actor_employee.id)
         leave_query = leave_query.filter(LeaveRequest.employee_id.in_(report_ids or [0]))
     elif actor.role == "employee":
         leave_query = leave_query.filter(LeaveRequest.employee_id == actor_employee.id)

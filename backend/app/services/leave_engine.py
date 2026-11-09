@@ -360,13 +360,33 @@ def recommend_window(
     avoid_start: date | None = None,
     earliest: date | None = None,
 ) -> dict | None:
+    ranked = rank_leave_windows(
+        db,
+        employee,
+        business_days,
+        avoid_start=avoid_start,
+        earliest=earliest,
+        limit=1,
+    )
+    return ranked[0] if ranked else None
+
+
+def rank_leave_windows(
+    db: Session,
+    employee: Employee,
+    business_days: int,
+    *,
+    avoid_start: date | None = None,
+    earliest: date | None = None,
+    limit: int = 3,
+) -> list[dict]:
+    """Score upcoming Monday-start windows by policy blocks, coverage, and overlaps."""
     today = org_today()
     cursor = earliest or (today + timedelta(days=1))
     while cursor.weekday() != 0:
         cursor += timedelta(days=1)
     closed = holidays_for_employee(db, employee, cursor, cursor + timedelta(days=180)).dates
-    best = None
-    best_score = None
+    scored: list[tuple[int, dict]] = []
     for _ in range(18):
         end = add_business_days(cursor, business_days, closed)
         if avoid_start and cursor == avoid_start:
@@ -380,13 +400,68 @@ def recommend_window(
             score += 50
         score += int((1 - assessed["available_pct"]) * 20)
         score += len(assessed["overlaps"])
-        if best_score is None or score < best_score:
-            best = assessed
-            best_score = score
-        if score == 0:
-            break
+        scored.append((score, assessed))
         cursor += timedelta(days=7)
-    return best
+    scored.sort(key=lambda item: (item[0], item[1]["start"]))
+    return [item for _score, item in scored[: max(limit, 1)]]
+
+
+def recommend_leave_dates(
+    db: Session,
+    employee: Employee,
+    *,
+    business_days: int | None = None,
+    leave_type: str = "annual",
+) -> dict:
+    """Recommend suitable leave windows from balance, policy, holidays, and team coverage.
+
+    Guidance only — never creates or submits a leave request.
+    """
+    balance = get_balance(db, employee.id, leave_type, LEAVE_YEAR)
+    remaining = remaining_days(balance)
+    # Prefer a short planning duration that the balance can usually support.
+    if business_days is None:
+        if remaining <= 0:
+            days = 5
+        elif remaining < 5:
+            days = max(1, int(remaining))
+        else:
+            days = 5
+    else:
+        days = max(1, int(business_days))
+    options = rank_leave_windows(db, employee, days, limit=3)
+    best = options[0] if options else None
+    department = db.get(Department, employee.department_id)
+    manager = db.get(Employee, employee.manager_id) if employee.manager_id else None
+    approval_manager = db.get(Employee, employee.approval_manager_id) if employee.approval_manager_id else None
+    return {
+        "kind": "leave_plan",
+        "focus": "recommend_dates",
+        "leave_type": leave_type,
+        "assumed_business_days": days,
+        "duration_source": "stated" if business_days is not None else "balance_default",
+        "employee": {
+            **_person(employee, department.name if department else None),
+            "employee_number": employee.employee_number,
+            "manager": None if manager is None else _person(manager),
+            "approval_manager": None if approval_manager is None else _person(approval_manager),
+            "routing_consistent": employee.manager_id == employee.approval_manager_id,
+        },
+        "balance": balance_payload(balance, leave_type),
+        "requested_window": best,
+        "recommended_window": best,
+        "recommended_options": options,
+        "confirmation_required": False,
+        "workflow_state": "RECOMMENDATION",
+        "rules_applied": [
+            f"Assumed duration is {days} business day(s)"
+            + (" from your question." if business_days is not None else " from remaining balance guidance (default up to 5)."),
+            f"Annual entitlement reference is {ANNUAL_ENTITLEMENT} days (Annual Leave Policy 3.0).",
+            f"Notice is {NOTICE_SHORT} business days up to 5 days and {NOTICE_LONG} above that.",
+            f"Team coverage guide is {COVERAGE_THRESHOLD:.0%} available after overlapping leave.",
+            "This is date guidance only. No leave request was drafted or submitted.",
+        ],
+    }
 
 
 def default_requested_window(business_days: int = 10) -> tuple[date, date]:
@@ -449,6 +524,79 @@ def _week_start(day: date) -> date:
     return day - timedelta(days=day.weekday())
 
 
+def _team_leave_overlap_pairs(
+    requests: list[tuple[LeaveRequest, Employee]],
+    *,
+    team_size: int,
+) -> list[dict]:
+    """Pairwise overlaps between different employees' pending/approved leave windows."""
+    pairs: list[dict] = []
+    for index, (left_req, left_emp) in enumerate(requests):
+        for right_req, right_emp in requests[index + 1 :]:
+            if left_emp.id == right_emp.id:
+                continue
+            if not _overlaps(left_req.start_date, left_req.end_date, right_req.start_date, right_req.end_date):
+                continue
+            overlap_start = max(left_req.start_date, right_req.start_date)
+            overlap_end = min(left_req.end_date, right_req.end_date)
+            overlap_days = business_days_inclusive(overlap_start, overlap_end)
+            # During the shared window both people are out; coverage uses distinct people.
+            people_out = 2
+            available = max(team_size - people_out, 0)
+            available_pct = round(available / team_size, 4) if team_size else 1.0
+            if available_pct < COVERAGE_THRESHOLD:
+                risk = "high"
+                risk_why = (
+                    f"Shared leave window reduces team availability to {available_pct:.0%}, "
+                    f"below the {COVERAGE_THRESHOLD:.0%} coverage threshold."
+                )
+            elif overlap_days >= 3:
+                risk = "medium"
+                risk_why = (
+                    f"{overlap_days} overlapping business days between two direct reports "
+                    "can delay handoffs and backlog clearance."
+                )
+            else:
+                risk = "low"
+                risk_why = (
+                    f"Short overlap ({overlap_days} business day(s)); still review approvals "
+                    "so both absences are not left unstaffed."
+                )
+            pairs.append(
+                {
+                    "left_employee_id": left_emp.id,
+                    "right_employee_id": right_emp.id,
+                    "left_name": left_emp.full_name,
+                    "right_name": right_emp.full_name,
+                    "left_request_id": left_req.id,
+                    "right_request_id": right_req.id,
+                    "left_status": left_req.status,
+                    "right_status": right_req.status,
+                    "left_start": left_req.start_date.isoformat(),
+                    "left_end": left_req.end_date.isoformat(),
+                    "right_start": right_req.start_date.isoformat(),
+                    "right_end": right_req.end_date.isoformat(),
+                    "overlap_start": overlap_start.isoformat(),
+                    "overlap_end": overlap_end.isoformat(),
+                    "overlap_business_days": overlap_days,
+                    "people_out": people_out,
+                    "available_pct": available_pct,
+                    "operational_risk": risk,
+                    "risk_explanation": risk_why,
+                }
+            )
+    pairs.sort(
+        key=lambda item: (
+            0 if item["operational_risk"] == "high" else 1 if item["operational_risk"] == "medium" else 2,
+            -item["overlap_business_days"],
+            item["overlap_start"],
+            item["left_name"],
+            item["right_name"],
+        )
+    )
+    return pairs
+
+
 def analyze_team(db: Session, manager: Employee) -> dict:
     members = team_members(db, manager.id)
     member_ids = [member.id for member in members]
@@ -465,6 +613,7 @@ def analyze_team(db: Session, manager: Employee) -> dict:
         )
         .all()
     )
+    overlap_pairs = _team_leave_overlap_pairs(requests, team_size=len(members))
     clusters: dict[date, list] = {}
     for request, employee in requests:
         cursor = max(request.start_date, today)
@@ -534,12 +683,23 @@ def analyze_team(db: Session, manager: Employee) -> dict:
     if critical:
         alternatives.append("Keep at least one senior contributor assigned to the critical deadline in the office that week.")
     alternatives.append("Do not split a decision by seniority or tenure. This recommendation uses request length and the coverage threshold only.")
-    risk_level = "high" if critical or available_pct < COVERAGE_THRESHOLD else "medium" if selected else "low"
+    risk_level = (
+        "high"
+        if critical or available_pct < COVERAGE_THRESHOLD or any(p["operational_risk"] == "high" for p in overlap_pairs)
+        else "medium"
+        if selected or overlap_pairs
+        else "low"
+    )
     return {
+        "kind": "team_conflict",
+        "focus": "overlap",
         "manager": _person(manager),
         "team_size": team_size,
+        "scope": "direct_reports",
         "window": {"start": week.isoformat(), "end": week_end.isoformat(), "label": f"week of {format_day(week)}"},
         "requests": selected,
+        "overlap_pairs": overlap_pairs,
+        "overlap_count": len(overlap_pairs),
         "available_now": available,
         "available_pct": available_pct,
         "projects": project_hits,
@@ -554,19 +714,53 @@ def analyze_team(db: Session, manager: Employee) -> dict:
         },
         "risk_level": risk_level,
         "rules_applied": [
-            "Counts come from leave requests and project deadlines in the simulated HRIS.",
-            "Availability is team size minus distinct people with overlapping approved or pending leave.",
-            "No likelihood, performance, or personal circumstance is inferred.",
+            "Scope is limited to employees where manager_id matches the signed-in manager (or HR org-wide team scan).",
+            "Only pending_manager, pending_hr, and approved leave requests are compared.",
+            "An overlap is two different employees whose leave date ranges intersect.",
+            "Availability is team size minus distinct people out on overlapping leave.",
+            "No attendance analytics or organization-wide absence rates are used.",
         ],
     }
 
 
 def investigate_routing(db: Session, employee: Employee) -> dict:
-    department = db.get(Department, employee.department_id)
+    """Compare stored department / manager_id / approval_manager_id from PostgreSQL only.
+
+    Names are resolved from employee rows. Nothing is invented when an id is missing.
+    """
+    department = db.get(Department, employee.department_id) if employee.department_id else None
     prior = db.get(Department, employee.prior_department_id) if employee.prior_department_id else None
     manager = db.get(Employee, employee.manager_id) if employee.manager_id else None
     approval_manager = db.get(Employee, employee.approval_manager_id) if employee.approval_manager_id else None
-    consistent = employee.manager_id == employee.approval_manager_id and employee.manager_id is not None
+
+    missing_fields: list[str] = []
+    if employee.department_id is None or department is None:
+        missing_fields.append("department_id")
+    if employee.manager_id is None or manager is None:
+        missing_fields.append("manager_id")
+    if employee.approval_manager_id is None or approval_manager is None:
+        missing_fields.append("approval_manager_id")
+
+    ids_present = employee.manager_id is not None and employee.approval_manager_id is not None
+    mismatch = ids_present and employee.manager_id != employee.approval_manager_id
+    # Consistent only when department and both manager ids are present and the two manager ids match.
+    consistent = (
+        employee.department_id is not None
+        and department is not None
+        and ids_present
+        and manager is not None
+        and approval_manager is not None
+        and employee.manager_id == employee.approval_manager_id
+    )
+    if missing_fields and not mismatch:
+        record_status = "missing"
+    elif mismatch:
+        record_status = "mismatch"
+    elif consistent:
+        record_status = "consistent"
+    else:
+        record_status = "missing"
+
     open_requests = (
         db.query(LeaveRequest)
         .filter(LeaveRequest.employee_id == employee.id, LeaveRequest.status.in_(("pending_manager", "pending_hr")))
@@ -582,39 +776,190 @@ def investigate_routing(db: Session, employee: Employee) -> dict:
                     "start_date": request.start_date.isoformat(),
                     "end_date": request.end_date.isoformat(),
                     "status": request.status,
+                    "routed_manager_id": request.routed_manager_id,
+                    "expected_manager_id": employee.manager_id,
                     "routed_to": None if routed is None else routed.full_name,
                 }
             )
     issue = None
-    if not consistent:
+    if record_status == "mismatch":
         current_name = manager.full_name if manager else "nobody"
         approval_name = approval_manager.full_name if approval_manager else "nobody"
         issue = (
             f"{employee.full_name} currently reports to {current_name}, but leave approval is still routed to {approval_name}."
         )
+    elif record_status == "missing":
+        issue = (
+            f"{employee.full_name} is missing required routing field(s): {', '.join(missing_fields)}."
+        )
+    conflicting = {
+        "department_id": employee.department_id,
+        "department_name": None if department is None else department.name,
+        "prior_department_id": employee.prior_department_id,
+        "prior_department_name": None if prior is None else prior.name,
+        "manager_id": employee.manager_id,
+        "manager_name": None if manager is None else manager.full_name,
+        "approval_manager_id": employee.approval_manager_id,
+        "approval_manager_name": None if approval_manager is None else approval_manager.full_name,
+        "transfer_effective_date": employee.transfer_effective_date.isoformat() if employee.transfer_effective_date else None,
+    }
+    evidence = [
+        f"employees.id={employee.id} employee_number={employee.employee_number}",
+        f"employees.department_id={employee.department_id} ({conflicting['department_name'] or 'missing'})",
+        f"employees.manager_id={employee.manager_id} ({conflicting['manager_name'] or 'missing'})",
+        f"employees.approval_manager_id={employee.approval_manager_id} ({conflicting['approval_manager_name'] or 'missing'})",
+    ]
+    if employee.prior_department_id:
+        evidence.append(
+            f"employees.prior_department_id={employee.prior_department_id} ({conflicting['prior_department_name'] or 'unknown'})"
+        )
+    if employee.transfer_effective_date:
+        evidence.append(f"employees.transfer_effective_date={conflicting['transfer_effective_date']}")
+    for item in misrouted:
+        evidence.append(
+            f"leave_requests.id={item['request_id']} status={item['status']} "
+            f"routed_manager_id={item['routed_manager_id']} expected_manager_id={item['expected_manager_id']}"
+        )
+    if misrouted:
+        severity = "critical"
+    elif record_status == "mismatch" and (employee.transfer_effective_date or employee.prior_department_id):
+        severity = "high"
+    elif record_status == "mismatch":
+        severity = "medium"
+    elif record_status == "missing":
+        severity = "medium"
+    else:
+        severity = "none"
+    correction = (
+        None
+        if record_status != "mismatch" or manager is None
+        else {
+            "field": "approval_manager_id",
+            "subject_employee_id": employee.id,
+            "from_employee_id": None if approval_manager is None else approval_manager.id,
+            "from_name": None if approval_manager is None else approval_manager.full_name,
+            "to_employee_id": manager.id,
+            "to_name": manager.full_name,
+        }
+    )
     return {
+        "kind": "routing_investigation",
         "employee": _person(employee, department.name if department else None),
+        "employee_id": employee.id,
         "employee_number": employee.employee_number,
         "current_department": None if department is None else department.name,
         "prior_department": None if prior is None else prior.name,
-        "transfer_effective_date": employee.transfer_effective_date.isoformat() if employee.transfer_effective_date else None,
+        "transfer_effective_date": conflicting["transfer_effective_date"],
         "current_manager": None if manager is None else _person(manager),
         "approval_manager": None if approval_manager is None else _person(approval_manager),
         "consistent": consistent,
+        "record_status": record_status,
+        "missing_fields": missing_fields,
         "issue": issue,
+        "severity": severity,
+        "conflicting_values": conflicting,
+        "evidence": evidence,
         "open_requests_following_old_route": misrouted,
-        "correction": None
-        if consistent or manager is None or approval_manager is None
-        else {
-            "field": "approval_manager_id",
-            "from_employee_id": approval_manager.id,
-            "from_name": approval_manager.full_name,
-            "to_employee_id": manager.id,
-            "to_name": manager.full_name,
-        },
+        "recommended_correction": (
+            None
+            if correction is None
+            else (
+                f"Set approval_manager_id for {employee.full_name} from "
+                f"{correction.get('from_name') or 'nobody'} to {correction.get('to_name')}."
+            )
+        ),
+        "correction": correction,
         "rules_applied": [
             "Official routing uses approval_manager_id, not the chat message.",
             "A mismatch with manager_id is a data defect.",
+            "Missing fields are reported separately from id mismatches.",
             "Only an HR administrator can change the official record, after a human approval.",
+        ],
+    }
+
+
+def investigate_routing_discrepancies(db: Session) -> dict:
+    """HR Admin org-wide scan for manager_id vs approval_manager_id mismatches after transfers."""
+    employees = (
+        db.query(Employee)
+        .filter(Employee.employment_status == "active")
+        .order_by(Employee.last_name.asc(), Employee.first_name.asc())
+        .all()
+    )
+    cases = []
+    for employee in employees:
+        # Skip consistent routes, including top leaders with no manager and no approver.
+        if employee.manager_id == employee.approval_manager_id:
+            continue
+        detail = investigate_routing(db, employee)
+        if detail.get("consistent"):
+            continue
+        cases.append(detail)
+    # Urgency: open misrouted leave first, then transfer-dated mismatches, then name.
+    cases.sort(
+        key=lambda item: (
+            0 if item.get("open_requests_following_old_route") else 1,
+            0 if item.get("severity") == "critical" else 1 if item.get("severity") == "high" else 2,
+            0 if item.get("prior_department") or item.get("transfer_effective_date") else 1,
+            (item.get("employee") or {}).get("full_name") or "",
+        )
+    )
+    primary = cases[0] if cases else None
+    return {
+        "kind": "routing_audit",
+        "focus": "summary",
+        "consistent": not cases,
+        "case_count": len(cases),
+        "cases": cases,
+        "most_urgent": primary,
+        "employee": (primary or {}).get("employee"),
+        "employee_id": (primary or {}).get("employee_id"),
+        "employee_number": (primary or {}).get("employee_number"),
+        "current_department": (primary or {}).get("current_department"),
+        "prior_department": (primary or {}).get("prior_department"),
+        "transfer_effective_date": (primary or {}).get("transfer_effective_date"),
+        "current_manager": (primary or {}).get("current_manager"),
+        "approval_manager": (primary or {}).get("approval_manager"),
+        "severity": (primary or {}).get("severity"),
+        "conflicting_values": (primary or {}).get("conflicting_values"),
+        "evidence": (primary or {}).get("evidence") or [],
+        "issue": (
+            None
+            if not cases
+            else (
+                f"Found {len(cases)} active employee record(s) where leave approval routing does not match "
+                f"the current reporting manager. Most urgent: {primary.get('issue')}"
+                if primary
+                else f"Found {len(cases)} routing discrepancies."
+            )
+        ),
+        "open_requests_following_old_route": (primary or {}).get("open_requests_following_old_route") or [],
+        "correction": (primary or {}).get("correction"),
+        "recommended_correction": (primary or {}).get("recommended_correction"),
+        "likely_cause": (
+            "After a department transfer, manager_id / department_id were updated but approval_manager_id was left on the "
+            "previous manager, so new and open leave requests keep routing to the stale approver."
+            if cases
+            else None
+        ),
+        "recommended_actions": [
+            "Update approval_manager_id to the current line manager for each mismatched employee.",
+            "Re-route any open pending_manager leave requests that still point at the previous approver.",
+            "Add a post-transfer checklist so People Operations updates department, manager_id, approval_manager_id, and transfer_effective_date together.",
+        ]
+        if cases
+        else ["No routing correction is required from this scan."],
+        "why_important": (
+            "Stale approval ownership delays leave decisions, can leave open requests with the wrong manager, "
+            "and creates compliance risk after department transfers because the HRIS reporting line and approval "
+            "ownership no longer match."
+            if cases
+            else None
+        ),
+        "rules_applied": [
+            "Scan compares employees.manager_id with employees.approval_manager_id for active employees.",
+            "Prior department and transfer_effective_date come from the employee record when present.",
+            "Open leave_requests.routed_manager_id is compared with the current manager_id for severity.",
+            "Only an HR administrator can change the official record after confirmation.",
         ],
     }

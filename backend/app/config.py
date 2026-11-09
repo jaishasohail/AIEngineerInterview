@@ -41,12 +41,15 @@ class Settings(BaseSettings):
     openrouter_api_key: str = ""
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     openrouter_model: str = "openai/gpt-4o-mini"
+    openrouter_timeout_seconds: float = 40
+    openrouter_max_retries: int = 3
     embedding_provider: str = "local"
     embedding_model: str = "minishlab/potion-retrieval-32M"
     embedding_dimensions: int = 512
     embedding_api_key: str = ""
     embedding_base_url: str = ""
     embedding_timeout_seconds: float = 60
+    embedding_batch_size: int = 32
     rerank_enabled: bool = False
     rerank_model: str = "Xenova/ms-marco-MiniLM-L-6-v2"
     cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000"

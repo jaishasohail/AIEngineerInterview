@@ -360,8 +360,31 @@ def team_analytics_report(db: Session, manager: Employee, message: str, inherite
     else:
         scoped, department = members, None
 
-    if re.search(r"\b(awaiting my approval|waiting for my (approval|decision)|assigned to me)\b", text):
-        return _awaiting_approval(db, manager, members, departments)
+    from app.ai.context import approval_inbox_followup_focus, approval_inbox_question
+
+    inbox_focus = approval_inbox_followup_focus(text)
+    if (
+        approval_inbox_question(text)
+        or inbox_focus in {"urgency", "why_urgent", "approve_impact", "reject_impact"}
+        or (
+            re.search(r"\bhighest (?:operational )?risk\b", text)
+            and re.search(r"\b(request|approval|pending|which|one)\b", text)
+            and not re.search(r"\b(overlap|overlapping|same week|three members|project delivery)\b", text)
+        )
+    ):
+        rank_risk = bool(
+            inbox_focus in {"urgency", "why_urgent", "approve_impact", "reject_impact"}
+            or re.search(r"\bhighest (?:operational )?risk\b", text)
+        )
+        return _awaiting_approval(
+            db,
+            manager,
+            members,
+            departments,
+            rank_by_risk=rank_risk,
+            followup_focus=inbox_focus,
+            inherited=inherited,
+        )
     # Project assignments and work locations are roster attributes of the manager's own reports.
     if re.search(r"\b(projects?|assigned to|assignments?|allocation|allocated)\b", text) and not re.search(
         r"\b(leave|attendance|absent|remote)\b", text
@@ -917,8 +940,57 @@ def _person(row: Employee, departments: dict[int, str]) -> dict:
     }
 
 
-def _awaiting_approval(db: Session, manager: Employee, members: list[Employee], departments: dict[int, str]) -> dict:
+def _risk_rank(level: str | None) -> int:
+    order = {"blocked": 4, "high": 3, "medium": 2, "low": 1}
+    return order.get((level or "").lower(), 0)
+
+
+def _request_operational_risk(db: Session, row: LeaveRequest, owner: Employee | None) -> dict:
+    """Use stored impact assessment when present; otherwise compute from leave_engine."""
+    impact = row.impact_json if isinstance(row.impact_json, dict) else {}
+    if impact.get("risk_level"):
+        return {
+            "risk_level": impact.get("risk_level") or "low",
+            "risks": list(impact.get("risks") or []),
+            "critical_conflict": bool(impact.get("critical_conflict")),
+            "available_pct": impact.get("available_pct"),
+            "hr_required": bool(impact.get("hr_required") or row.hr_required),
+            "overlaps": list(impact.get("overlaps") or []),
+        }
+    if owner is None:
+        return {
+            "risk_level": "medium" if row.hr_required else "low",
+            "risks": [],
+            "critical_conflict": False,
+            "available_pct": None,
+            "hr_required": bool(row.hr_required),
+            "overlaps": [],
+        }
+    from app.services.leave_engine import assess_window
+
+    assessed = assess_window(db, owner, row.start_date, row.end_date, leave_type=row.leave_type or "annual")
+    return {
+        "risk_level": assessed.get("risk_level") or "low",
+        "risks": list(assessed.get("risks") or []),
+        "critical_conflict": bool(assessed.get("critical_conflict")),
+        "available_pct": assessed.get("available_pct"),
+        "hr_required": bool(assessed.get("hr_required") or row.hr_required),
+        "overlaps": list(assessed.get("overlaps") or []),
+    }
+
+
+def _awaiting_approval(
+    db: Session,
+    manager: Employee,
+    members: list[Employee],
+    departments: dict[int, str],
+    *,
+    rank_by_risk: bool = False,
+    followup_focus: str | None = None,
+    inherited: dict | None = None,
+) -> dict:
     """Leave still pending where this manager is the routed/assigned approver."""
+    inherited = inherited or {}
     member_ids = [row.id for row in members]
     rows = (
         db.query(LeaveRequest)
@@ -932,9 +1004,10 @@ def _awaiting_approval(db: Session, manager: Employee, members: list[Employee], 
     )
     by_id = {row.id: row for row in members}
     people = []
-    for row in rows[:PAGE]:
+    for row in rows:
         person = by_id.get(row.employee_id)
         item = _person(person, departments) if person else {"full_name": "", "employee_number": "", "department": ""}
+        risk = _request_operational_risk(db, row, person)
         item.update(
             {
                 "request_id": row.id,
@@ -944,18 +1017,111 @@ def _awaiting_approval(db: Session, manager: Employee, members: list[Employee], 
                 "end": row.end_date.isoformat(),
                 "business_days": row.business_days,
                 "assigned_approver_id": row.routed_manager_id,
+                "risk_level": risk["risk_level"],
+                "risks": risk["risks"],
+                "critical_conflict": risk["critical_conflict"],
+                "available_pct": risk["available_pct"],
+                "hr_required": risk["hr_required"],
+                "overlap_count": len(risk["overlaps"]),
             }
         )
         people.append(item)
+    people.sort(
+        key=lambda item: (
+            -_risk_rank(item.get("risk_level")),
+            -float(item.get("business_days") or 0),
+            -(item.get("overlap_count") or 0),
+            item.get("request_id") or 0,
+        )
+    )
+    selected = None
+    selected_id = inherited.get("selected_request_id") or inherited.get("request_id")
+    if selected_id is not None:
+        selected = next((item for item in people if item.get("request_id") == int(selected_id)), None)
+    # Urgency ranking may default to the highest-risk request. Approve/reject impact must not
+    # invent a request id when the conversation has not established one.
+    if selected is None and people and followup_focus not in {"approve_impact", "reject_impact"}:
+        selected = people[0]
+    if followup_focus == "why_urgent":
+        target = selected or (people[0] if people else None)
+        return {
+            "kind": "team_analytics",
+            "focus": "awaiting_approval_why_urgent",
+            "team_size": len(members),
+            "people": [target] if target else [],
+            "people_count": len(people),
+            "highest": target,
+            "selected_request_id": None if target is None else target.get("request_id"),
+            "inbox": people[:PAGE],
+            "note": (
+                "Urgency is explained from the stored operational-risk factors for the selected "
+                "pending_manager request. No approval was executed."
+            ),
+        }
+    if followup_focus == "approve_impact":
+        target = selected
+        return {
+            "kind": "team_analytics",
+            "focus": "awaiting_approval_impact",
+            "decision": "approve",
+            "team_size": len(members),
+            "people": [target] if target else [],
+            "people_count": len(people),
+            "highest": target,
+            "selected_request_id": None if target is None else target.get("request_id"),
+            "inbox": people[:PAGE],
+            "note": (
+                "This explains the operational effect of approving"
+                + (f" request {target.get('request_id')}" if target else " a pending leave request")
+                + ". No approval was executed; confirmation is still required to prepare a decision."
+            ),
+        }
+    if followup_focus == "reject_impact":
+        target = selected
+        return {
+            "kind": "team_analytics",
+            "focus": "awaiting_approval_reject_impact",
+            "decision": "reject",
+            "team_size": len(members),
+            "people": [target] if target else [],
+            "people_count": len(people),
+            "highest": target,
+            "selected_request_id": None if target is None else target.get("request_id"),
+            "inbox": people[:PAGE],
+            "note": (
+                "This explains the operational effect of rejecting"
+                + (f" request {target.get('request_id')}" if target else " a pending leave request")
+                + ". No rejection was executed; confirmation is still required to prepare a decision."
+            ),
+        }
+    if rank_by_risk or followup_focus == "urgency":
+        top = people[:1]
+        return {
+            "kind": "team_analytics",
+            "focus": "awaiting_approval_risk",
+            "team_size": len(members),
+            "people": top,
+            "people_count": len(people),
+            "highest": top[0] if top else None,
+            "selected_request_id": None if not top else top[0].get("request_id"),
+            "inbox": people[:PAGE],
+            "note": (
+                "Operational risk / urgency is ranked from stored leave-impact assessments for "
+                "pending_manager requests routed to you (critical deadline, coverage, overlaps, "
+                "HR co-approval). This is decision support only; no request was approved or rejected."
+            ),
+        }
     return {
         "kind": "team_analytics",
         "focus": "awaiting_approval",
         "team_size": len(members),
-        "people": people,
+        "people": people[:PAGE],
         "people_count": len(rows),
+        "selected_request_id": None if not people else people[0].get("request_id"),
+        "highest": people[0] if people else None,
         "note": (
-            "These are pending_manager requests routed to the signed-in manager. "
-            "Assigned approver is not the same as an approval decision. No decision rows are implied."
+            "These are pending_manager requests routed to the signed-in manager, ordered with higher "
+            "operational risk first. Assigned approver is not the same as an approval decision."
         ),
     }
 

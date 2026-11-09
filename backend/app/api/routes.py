@@ -5,7 +5,13 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from app.access import AuthorizationError, can_view_leave, employee_for_user, redact_employee
+from app.access import (
+    AuthorizationError,
+    can_view_employee_record,
+    can_view_leave,
+    employee_for_user,
+    redact_employee,
+)
 from app.ai.eval import evaluate_retrieval
 from app.ai.runtime import add_message, confirm_turn, json_safe, run_turn, stream_turn
 from app.api.deps import client_ip, get_current_user, get_db
@@ -18,6 +24,7 @@ from app.services.actions import decide_approval, submit_leave
 from app.services.analytics_engine import absence_analytics
 from app.services.dashboard import build_dashboard
 from app.services.leave_engine import balance_payload, get_balance
+from app.services.notifications import list_notifications
 
 router = APIRouter()
 
@@ -140,10 +147,8 @@ def get_employee(employee_id: int, request: Request, user: User = Depends(get_cu
     if subject is None:
         raise HTTPException(status_code=404, detail="Employee not found")
     department = db.get(Department, subject.department_id)
-    private = user.role == "hr_admin" or user.employee_id == subject.id or (
-        user.role == "manager" and can_view_leave(db, user, actor_employee, subject)
-    )
-    if not private and user.employee_id != subject.id:
+    private = can_view_employee_record(db, user, actor_employee, subject)
+    if not private:
         write_audit(
             db,
             actor_user_id=user.id,
@@ -155,7 +160,7 @@ def get_employee(employee_id: int, request: Request, user: User = Depends(get_cu
             ip_address=client_ip(request),
         )
         raise HTTPException(status_code=403, detail="You cannot open that employee record")
-    if private and user.employee_id != subject.id:
+    if user.employee_id != subject.id:
         write_audit(
             db,
             actor_user_id=user.id,
@@ -417,10 +422,33 @@ def audit(limit: int = 100, user: User = Depends(get_current_user), db: Session 
     }
 
 
+@router.get("/notifications")
+def notifications(
+    limit: int = 50,
+    unread_only: bool = False,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """List in-app HR workflow notifications for the signed-in employee.
+
+    Helios has no external email/SMS/WhatsApp provider. These rows are recorded
+    in-app only; delivery_status 'recorded' does not mean an external message was sent.
+    """
+    actor = employee_for_user(db, user)
+    rows = list_notifications(db, recipient_employee_id=actor.id, limit=limit, unread_only=unread_only)
+    return {
+        "notifications": rows,
+        "channel": "in_app",
+        "external_provider": None,
+        "note": "Notifications are persisted in Helios only. No external email provider is configured.",
+    }
+
+
 @router.get("/settings")
 def settings(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict:
     config = get_settings()
     balance = get_balance(db, user.employee_id)
+    # Never return secrets, connection strings, API keys, or JWT material.
     return {
         "profile": _user_payload(db, user),
         "org_clock": config.org_clock,
@@ -429,9 +457,10 @@ def settings(user: User = Depends(get_current_user), db: Session = Depends(get_d
         "embedding_mode": f"{config.embedding_provider}:{config.embedding_model}",
         "embedding_dimensions": config.embedding_dimensions,
         "rerank_enabled": config.rerank_enabled,
-        "database": "postgresql" if config.database_url.startswith("postgresql") else config.database_url.split(":", 1)[0],
+        "database": "postgresql" if config.database_url.startswith("postgresql") else "sqlite",
         "annual_remaining": None if balance is None else balance_payload(balance)["remaining"],
         "demo_password_hint": "Use the password from the README. It is not returned by the API.",
+        "secrets_exposed": False,
     }
 
 

@@ -20,7 +20,7 @@ from app.database import (
 )
 from app.ai.ingest import ingest_policies
 from app.seed import ensure_seeded
-from app.services.indexing import refresh_stale_policies
+from app.services.indexing import refresh_stale_policies, sync_policy_lifecycle, verify_index
 
 logger = logging.getLogger("helios")
 if not logger.handlers:
@@ -43,13 +43,24 @@ async def lifespan(_app: FastAPI):
         upgrade_postgres()
     reset_graph()
     get_graph()
+    logger.disabled = False
     if settings.auto_seed:
         db = next(session_scope())
         try:
             ensure_seeded(db)
             try:
                 ingest_policies(db)
+                sync_policy_lifecycle(db)
                 refresh_stale_policies(db)
+                health = verify_index(db)
+                if health.get("healthy"):
+                    logger.info(
+                        "Policy index healthy: %s documents, %s chunks",
+                        health["documents"]["total"],
+                        health["chunks"]["total"],
+                    )
+                else:
+                    logger.warning("Policy index issues detected: %s", health.get("issues"))
             except EmbeddingUnavailable as exc:
                 logger.error("Dense embeddings are unavailable. Retrieval will report degraded keyword mode. %s", exc)
         finally:
@@ -58,7 +69,6 @@ async def lifespan(_app: FastAPI):
         f"Helios ready. LLM enabled={settings.llm_enabled} "
         f"embedding={settings.embedding_provider}/{settings.embedding_model}"
     )
-    logger.disabled = False
     logger.info(ready)
     yield
 

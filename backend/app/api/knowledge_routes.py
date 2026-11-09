@@ -17,6 +17,8 @@ from app.services.indexing import (
     parse_optional_date,
     reindex_all,
     slugify,
+    sync_policy_lifecycle,
+    verify_index,
 )
 
 router = APIRouter()
@@ -59,14 +61,17 @@ def policy_index(user: User = Depends(get_current_user), db: Session = Depends(g
     settings = get_settings()
     documents = db.query(PolicyDocument).order_by(PolicyDocument.title, PolicyDocument.version).all()
     jobs = db.query(IndexJob).order_by(IndexJob.id.desc()).limit(30).all()
+    health = verify_index(db)
     return {
         "embedding": {
             "provider": settings.embedding_provider,
             "model": settings.embedding_model,
             "dimensions": settings.embedding_dimensions,
+            "batch_size": settings.embedding_batch_size,
             "rerank_enabled": settings.rerank_enabled,
             "rerank_model": settings.rerank_model if settings.rerank_enabled else None,
         },
+        "health": health,
         "documents": [_document_payload(row) for row in documents],
         "jobs": [
             {
@@ -85,18 +90,20 @@ def policy_index(user: User = Depends(get_current_user), db: Session = Depends(g
 @router.post("/policies/reindex")
 def reindex_policies(request: Request, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict:
     _require_hr(user)
+    lifecycle = sync_policy_lifecycle(db)
     results = reindex_all(db, force=True)
+    health = verify_index(db)
     write_audit(
         db,
         actor_user_id=user.id,
         action="policy_reindex",
         resource_type="policy_index",
         resource_id="all",
-        outcome="success",
-        details={"results": results},
+        outcome="success" if health.get("healthy") else "partial",
+        details={"results": results, "lifecycle": lifecycle, "healthy": health.get("healthy")},
         ip_address=client_ip(request),
     )
-    return {"results": results}
+    return {"results": results, "lifecycle": lifecycle, "health": health}
 
 
 @router.post("/policies/upload")

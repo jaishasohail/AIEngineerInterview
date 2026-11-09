@@ -205,8 +205,31 @@ class Conversation(Base):
     title: Mapped[str] = mapped_column(String(180), nullable=False)
     status: Mapped[str] = mapped_column(String(40), default="active", nullable=False)
     active_thread_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    pending_action_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class PendingAction(Base):
+    """Durable human-in-the-loop action awaiting explicit confirmation."""
+
+    __tablename__ = "pending_actions"
+    __table_args__ = (UniqueConstraint("idempotency_key", name="uq_pending_actions_idempotency"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    owner_user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
+    conversation_id: Mapped[int | None] = mapped_column(ForeignKey("conversations.id"), nullable=True, index=True)
+    action_type: Mapped[str] = mapped_column(String(60), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(30), nullable=False, default="awaiting_confirmation", index=True)
+    idempotency_key: Mapped[str] = mapped_column(String(180), nullable=False)
+    payload_json: Mapped[dict] = mapped_column(JSON, nullable=False)
+    result_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    thread_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    executed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class Message(Base):
@@ -232,6 +255,35 @@ class AuditLog(Base):
     details_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     ip_address: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+
+
+class HrNotification(Base):
+    """In-app HR workflow notification. No external email/SMS/WhatsApp delivery."""
+
+    __tablename__ = "hr_notifications"
+    __table_args__ = (
+        UniqueConstraint(
+            "event_type",
+            "resource_type",
+            "resource_id",
+            "recipient_employee_id",
+            name="uq_hr_notifications_event_recipient",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    recipient_employee_id: Mapped[int] = mapped_column(ForeignKey("employees.id"), nullable=False, index=True)
+    recipient_role: Mapped[str] = mapped_column(String(30), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(60), nullable=False, index=True)
+    resource_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    resource_id: Mapped[str] = mapped_column(String(60), nullable=False)
+    title: Mapped[str] = mapped_column(String(180), nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    channel: Mapped[str] = mapped_column(String(40), nullable=False, default="in_app")
+    delivery_status: Mapped[str] = mapped_column(String(30), nullable=False, default="recorded")
+    payload_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class Holiday(Base):

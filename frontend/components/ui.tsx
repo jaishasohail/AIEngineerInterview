@@ -74,10 +74,11 @@ export function Badge({ children, tone = "ink" }: { children: ReactNode; tone?: 
 }
 
 export function statusTone(status: string): "ink" | "pine" | "copper" | "warn" | "bad" {
-  if (status === "approved" || status === "allowed" || status === "success") return "pine";
-  if (status === "rejected" || status === "denied" || status === "blocked") return "bad";
-  if (status === "pending_hr" || status === "conflict") return "copper";
-  if (status.includes("pending") || status === "high") return "warn";
+  const value = status.toLowerCase();
+  if (value === "approved" || value === "allowed" || value === "success" || value === "submitted" || value === "strong") return "pine";
+  if (value === "rejected" || value === "denied" || value === "blocked" || value === "failed" || value === "error") return "bad";
+  if (value === "pending_hr" || value === "conflict" || value === "weak") return "copper";
+  if (value.includes("pending") || value.includes("awaiting") || value === "high") return "warn";
   return "ink";
 }
 

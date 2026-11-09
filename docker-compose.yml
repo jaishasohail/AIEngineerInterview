@@ -9,7 +9,7 @@ services:
       # Windows PostgreSQL already listens on 5432, and Docker's proxy on 5433
       # was not delivering connections to this container. 55432 is the host port.
       # Containers still use postgres:5432 on the Compose network.
-      - "55432:5432"
+      - "55600:5432"
     volumes:
       - helios-pg:/var/lib/postgresql/data
     healthcheck:

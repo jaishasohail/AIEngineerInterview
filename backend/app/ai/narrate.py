@@ -205,6 +205,9 @@ def _narrate(state: dict) -> tuple[str, str]:
         return _organization(state)
     if intent == "team_roster":
         return _team_roster(state)
+    analysis_focus = ((state.get("analysis") or {}).get("focus") or "").lower()
+    if analysis_focus in {"awaiting_approval_approve_guidance", "awaiting_approval_reject_guidance"}:
+        return _team_analytics(state)
     if (state.get("analysis") or {}).get("kind") == "approval_inbox":
         return _approval_inbox(state)
     if intent == "team_analytics":
@@ -574,6 +577,43 @@ def _eligibility(state: dict) -> tuple[str, str]:
             f"A request within {hypothetical} {unit} can meet the balance rule. "
             "I am not using that hypothetical figure as a submitted request."
         )
+    window = analysis.get("proposed_window") or {}
+    if window.get("proposed_start") or window.get("start"):
+        start_label = window.get("proposed_start") or window.get("start")
+        lines.append(
+            f"Proposed start (from your wording, using org calendar {balance.get('year') if balance else 'today'}): {start_label}. "
+            "This is a planning anchor, not a submitted request."
+        )
+        if window.get("duration_specified") is False:
+            required = window.get("notice_required_example")
+            notice = window.get("notice_business_days")
+            if notice is not None and required is not None:
+                if window.get("notice_ok_for_example"):
+                    lines.append(
+                        f"Advance notice to that start is {notice} business day(s) from today. "
+                        f"Policy examples often require {required} business days for short annual leave — "
+                        "the stored notice rule is met for that start timing."
+                    )
+                else:
+                    lines.append(
+                        f"Advance notice to that start is only {notice} business day(s) from today; "
+                        f"policy may require {required} business days for short annual leave. "
+                        "That is a notice-period concern, separate from balance and manager approval."
+                    )
+        elif window.get("requested_days") and window.get("proposed_end"):
+            lines.append(
+                f"If you took {window['requested_days']} business days from {start_label} to {window['proposed_end']}, "
+                f"notice available is {window.get('notice_business_days')}; required is {window.get('notice_required')}. "
+                f"Balance rule: {'met' if window.get('balance_ok') else 'not met'}; "
+                f"notice: {'met' if window.get('notice_ok') else 'not met'} — "
+                "neither is manager approval."
+            )
+            for block in window.get("hard_blocks") or []:
+                lines.append(f"Constraint recorded: {block}.")
+    lines.append(
+        "Advance notice, remaining balance, and manager approval are separate checks. "
+        "Meeting one does not guarantee approval or confirmed leave dates."
+    )
     lines.append("The approval manager must approve a request before it is confirmed. I cannot approve it.")
     for citation in citations[:2]:
         lines.append(f"{citation['title']} v{citation['version']}: {citation['excerpt']}")
@@ -869,6 +909,18 @@ def _status(state: dict) -> tuple[str, str]:
 
 def _latest_question_lines(latest: dict, question: str) -> list[str]:
     status = latest.get("status") or ""
+    if question == "submitted":
+        if status in {"pending_manager", "pending_hr", "approved", "rejected", "cancelled"}:
+            return [
+                (
+                    f"Yes. Leave request {latest.get('id')} was submitted. "
+                    f"It is {latest.get('leave_type')} leave {latest.get('start')} to {latest.get('end')} "
+                    f"({latest.get('business_days')} business days). Current status: {status}."
+                )
+            ]
+        return [
+            f"No committed leave request was found with a submitted status. Latest stored status is {status or 'unknown'}."
+        ]
     if question == "approved":
         if status == "approved":
             return ["Yes. This latest request has been approved. That is its current status."]
@@ -933,6 +985,9 @@ def _approval_decision(state: dict) -> tuple[str, str]:
 
 def _team(state: dict) -> tuple[str, str]:
     analysis = state.get("analysis") or {}
+    if analysis.get("status") in {"needs_clarification", "invalid"} and analysis.get("message"):
+        msg = analysis["message"]
+        return msg, "Team overlap review needs clarification."
     window = analysis.get("window") or {}
     requests = analysis.get("requests") or []
     pairs = analysis.get("overlap_pairs") or []
@@ -958,11 +1013,17 @@ def _team(state: dict) -> tuple[str, str]:
                 f"{item.get('right_start')} to {item.get('right_end')}) on "
                 f"{item.get('overlap_start')} to {item.get('overlap_end')} "
                 f"({item.get('overlap_business_days')} business day(s)). "
-                f"Coverage while both are out: {item.get('available_pct', 0):.0%}. "
+                f"Coverage while both are out: {float(item.get('available_pct') or 0):.0%}. "
                 f"Operational risk: {item.get('operational_risk')} — {item.get('risk_explanation')}"
             )
         if len(pairs) > 12:
             lines.append(f"...and {len(pairs) - 12} additional overlap pair(s).")
+        lines.append(
+            "Statuses shown are leave-request workflow states (pending_manager / pending_hr / approved); "
+            "pending requests are not confirmed absences."
+        )
+        lines.append(_cite_line(state.get("citations") or []))
+        return "\n\n".join(lines), summary
     elif not requests:
         summary = "No overlapping approved or pending leave was found in the review window for your direct reports."
         lines = [
@@ -973,10 +1034,10 @@ def _team(state: dict) -> tuple[str, str]:
         ]
         return "\n\n".join(lines), summary
     else:
-    summary = (
-        f"{len(requests)} overlapping requests in the {window.get('label')}. "
-        f"Availability is {analysis.get('available_pct', 0):.0%} before any change. Risk is {analysis.get('risk_level')}."
-    )
+        summary = (
+            f"{len(requests)} overlapping requests in the {window.get('label')}. "
+            f"Availability is {float(analysis.get('available_pct') or 0):.0%} before any change. Risk is {analysis.get('risk_level')}."
+        )
         lines = [summary, f"Team size used in the calculation: {team_size} direct reports."]
         detail = "; ".join(
             f"{item['full_name']} (request {item.get('request_id')}, {item['business_days']} days, "
@@ -984,36 +1045,76 @@ def _team(state: dict) -> tuple[str, str]:
             for item in requests
         )
         lines.append(detail + ".")
-    projects = analysis.get("projects") or []
-    if projects:
-        lines.append(
-            "Deadlines touching the densest week: "
-            + ", ".join(f"{item['name']} ({item['criticality']}, {item['deadline']})" for item in projects)
-            + "."
+        projects = analysis.get("projects") or []
+        if projects:
+            lines.append(
+                "Deadlines touching the densest week: "
+                + ", ".join(f"{item['name']} ({item['criticality']}, {item['deadline']})" for item in projects)
+                + "."
+            )
+        elif requests or pairs:
+            lines.append("No assigned project deadline falls in the densest overlapping week.")
+        defer = rec.get("defer") or []
+        keep = rec.get("can_consider") or []
+        if defer:
+            lines.append(
+                "Applying the 70% coverage rule defers "
+                + ", ".join(item["full_name"] for item in defer)
+                + f". Projected availability becomes {rec.get('projected_available_pct', 0):.0%}."
+            )
+        if keep:
+            lines.append("Still inside the densest week after that deferral: " + ", ".join(item["full_name"] for item in keep) + ".")
+        for alternative in rec.get("alternatives") or []:
+            lines.append(alternative)
+        lines.append("This is a recommendation for you to decide. I have not approved or rejected any request.")
+        lines.append(_cite_line(state.get("citations") or []))
+        return "\n\n".join(lines), summary
+
+
+def _format_workforce_corrective_proposal(prop: dict, *, pending: dict | None = None) -> tuple[str, str]:
+    dept = prop.get("target_department") or "the selected department"
+    summary = f"Prepared corrective action for {dept} (advisory only)."
+    evidence = prop.get("supporting_evidence") or {}
+    ev_line = ""
+    if isinstance(evidence, dict) and evidence.get("unplanned_absence_rate") is not None:
+        ev_line = (
+            f"Supporting evidence: unplanned rate {float(evidence['unplanned_absence_rate']):.1%} "
+            f"({evidence.get('unplanned_absent')}/{evidence.get('scheduled_days')} stored rows); "
+            f"month Δ {float(evidence.get('month_change_pp') or 0):+.2f} pp."
         )
-    elif requests or pairs:
-        lines.append("No assigned project deadline falls in the densest overlapping week.")
-    defer = rec.get("defer") or []
-    keep = rec.get("can_consider") or []
-    if defer:
-        lines.append(
-            "Applying the 70% coverage rule defers "
-            + ", ".join(item["full_name"] for item in defer)
-            + f". Projected availability becomes {rec.get('projected_available_pct', 0):.0%}."
-        )
-    if keep:
-        lines.append("Still inside the densest week after that deferral: " + ", ".join(item["full_name"] for item in keep) + ".")
-    for alternative in rec.get("alternatives") or []:
-        lines.append(alternative)
-    lines.append("This is a recommendation for you to decide. I have not approved or rejected any request.")
-    lines.append(_cite_line(state.get("citations") or []))
-    return "\n\n".join(lines), summary
+    lines = [
+        summary,
+        f"Target: {dept} (department-level workforce risk).",
+        f"Identified issue: {prop.get('identified_issue') or 'Workforce availability risk'}.",
+        f"Proposed corrective action: {prop.get('proposed_corrective_action')}.",
+    ]
+    if ev_line:
+        lines.append(ev_line)
+    elif evidence:
+        lines.append(f"Supporting evidence (stored analytics): {evidence}.")
+    lines.append(f"Expected outcome: {prop.get('expected_outcome')}.")
+    lines.append(
+        "This is a recorded HR recommendation only. Confirming will write an audit entry; "
+        "no attendance, leave, or employee records will change."
+    )
+    if pending and pending.get("confirmation_prompt"):
+        lines.append(pending["confirmation_prompt"])
+        lines.append("Reply Confirm this action to record it, or Cancel this action to discard without recording.")
+    return "\n".join(lines), summary
 
 
 def _analytics(state: dict) -> tuple[str, str]:
+    pending = state.get("pending_action") or {}
     analytics = state.get("analytics") or {}
     analysis = state.get("analysis") or {}
     focus = analysis.get("focus") or analytics.get("followup_focus") or "absence"
+    if (
+        pending.get("type") == "record_hr_corrective_recommendation"
+        and pending.get("pending_action_id")
+        and focus not in {"evidence"}
+    ):
+        prop = pending.get("proposal") or (state.get("analysis") or {}).get("proposal") or {}
+        return _format_workforce_corrective_proposal(prop, pending=pending)
     insights = analytics.get("insights") or []
     period = analytics.get("period") or {}
     method = analytics.get("method") or ""
@@ -1094,7 +1195,7 @@ def _analytics(state: dict) -> tuple[str, str]:
         elif scope == "self":
             summary = "Unusual attendance patterns in your own attendance extract."
         else:
-        summary = "Organization-wide unusual attendance patterns from the attendance extract."
+            summary = "Organization-wide unusual attendance patterns from the attendance extract."
         lines = [
             summary,
             method,
@@ -1167,6 +1268,73 @@ def _analytics(state: dict) -> tuple[str, str]:
         for note in limitations:
             lines.append(f"Limitation: {note}")
         return "\n".join(lines), summary
+    if focus == "workforce_risk_plan":
+        investigation = analysis.get("investigation") or analytics.get("investigation") or []
+        findings = (
+            analysis.get("workforce_risk_findings")
+            or analytics.get("workforce_risk_findings")
+            or (analysis.get("recommendations") or {}).get("workforce_risk_findings")
+            or []
+        )
+        rec = analysis.get("recommendations") or analytics.get("recommendations") or {}
+        action_plan = rec.get("action_plan") or []
+        limitations = analysis.get("limitations") or analytics.get("limitations") or []
+        period = analytics.get("period") or {}
+        summary = "Organization-level workforce availability risks and a grounded HR action plan."
+        lines = [
+            summary,
+            method,
+            f"Analytics window: {period.get('start')} to {period.get('end')} (scope: {analytics.get('scope')}).",
+            "Organization-level risk analysis (measured facts vs inferred operational risks):",
+        ]
+        if not findings:
+            lines.append("No department risk ranking is available for this scope.")
+        for item in findings[:6]:
+            sample = f" [{item.get('risk_level')}]" if item.get("risk_level") else ""
+            lines.append(f"{item.get('department')}{sample} (score {item.get('investigation_score')}):")
+            for fact in item.get("measured_facts") or []:
+                lines.append(f"  Fact: {fact}")
+            for reason in item.get("risk_reasons") or []:
+                lines.append(f"  Why flagged: {reason}")
+            for risk in item.get("inferred_operational_risks") or []:
+                lines.append(f"  Inferred risk (not confirmed incident): {risk}")
+            for lim in item.get("limitations") or []:
+                lines.append(f"  Limitation: {lim}")
+        lines.append("Grounded action plan:")
+        if not action_plan:
+            lines.append("No evidence-based actions were generated for this scope.")
+        for step in action_plan:
+            if step.get("rank") == 0:
+                lines.append(f"Governance: {step.get('recommended_action')}")
+                continue
+            lines.append(
+                f"{step.get('rank')}. {step.get('issue')} — Priority: {step.get('priority')}. "
+                f"Owner: {step.get('responsible_role')}."
+            )
+            lines.append(f"   Action: {step.get('recommended_action')}")
+            ev = step.get("evidence") or {}
+            if isinstance(ev, dict) and ev.get("unplanned_absence_rate") is not None:
+                lines.append(
+                    f"   Evidence: rate {float(ev['unplanned_absence_rate']):.1%} "
+                    f"({ev.get('unplanned_absent')}/{ev.get('scheduled_days')}); "
+                    f"month Δ {float(ev.get('month_change_pp') or 0):+.2f} pp; "
+                    f"anomalies {ev.get('anomaly_count')}."
+                )
+            lines.append(f"   Monitor: {step.get('measurable_outcome')}")
+        lines.append(
+            "These steps are read-only analytics recommendations. No records were changed. "
+            "Do not treat attendance patterns as misconduct or medical findings."
+        )
+        for note in limitations[:4]:
+            lines.append(f"Limitation: {note}")
+        top = investigation[0] if investigation else {}
+        if top:
+            summary = (
+                f"Top workforce availability risk: {top.get('department')} "
+                f"({float(top.get('unplanned_absence_rate') or 0):.1%}); "
+                f"{len(action_plan) - 1} departmental action(s) proposed."
+            )
+        return "\n".join(lines), summary
     if focus == "investigation":
         ranked = analysis.get("investigation") or analytics.get("investigation") or []
         people = analysis.get("priority_employees") or analytics.get("priority_employees") or []
@@ -1222,26 +1390,38 @@ def _analytics(state: dict) -> tuple[str, str]:
             else:
                 lines.append("No evidence-based operational consequences are available for this scope.")
         else:
-        summary = "HR actions grounded in the preceding organization-wide attendance analytics."
-        lines = [summary]
-        if not actions:
-            lines.append("No evidence-based attendance actions are available for this scope.")
-        for action in actions:
-            lines.append(f"- {action}")
-        if focus == "consequences":
-            lines.extend(
-                [
-                    "- Coverage gaps: teams with rising unplanned absence may need temporary staffing or shifted delivery dates.",
-                    "- Approval backlog risk: more short-notice sick/absent days can increase same-week leave pressure.",
-                    "- Data-quality review: outlier department-months should be validated before any personnel action.",
-                ]
-            )
-        defs = rec.get("metric_definitions") or {}
-        if defs:
-            lines.append("Metric definitions used:")
-            for key, value in defs.items():
-                lines.append(f"{key}: {value}.")
-        return "\n".join(lines), summary
+            summary = "HR actions grounded in the preceding organization-wide attendance analytics."
+            lines = [summary]
+            if not actions:
+                lines.append("No evidence-based attendance actions are available for this scope.")
+            for action in actions:
+                lines.append(f"- {action}")
+            if focus == "consequences":
+                lines.extend(
+                    [
+                        "- Coverage gaps: teams with rising unplanned absence may need temporary staffing or shifted delivery dates.",
+                        "- Approval backlog risk: more short-notice sick/absent days can increase same-week leave pressure.",
+                        "- Data-quality review: outlier department-months should be validated before any personnel action.",
+                    ]
+                )
+            defs = rec.get("metric_definitions") or {}
+            if defs:
+                lines.append("Metric definitions used:")
+                for key, value in defs.items():
+                    lines.append(f"{key}: {value}.")
+            return "\n".join(lines), summary
+    if focus == "proposed_action":
+        prop = (state.get("analysis") or {}).get("proposal") or {}
+        prep = state.get("pending_action") or {}
+        if not prop and prep.get("proposal"):
+            prop = prep.get("proposal")
+        if prop:
+            return _format_workforce_corrective_proposal(prop, pending=prep if prep.get("pending_action_id") else None)
+        return (
+            "No corrective action has been prepared in this thread yet. "
+            "Ask me to prepare a corrective action for the department with the highest absenteeism first.",
+            "No prepared corrective action.",
+        )
     if focus == "evidence":
         rec = analysis.get("recommendations") or analytics.get("recommendations") or {}
         month_cmp = analysis.get("month_comparison") or analytics.get("month_comparison") or {}
@@ -1362,7 +1542,12 @@ def _transfer(state: dict) -> tuple[str, str]:
     analysis = state.get("analysis") or {}
     focus = (analysis.get("focus") or "").lower()
     pending = state.get("pending_action") or {}
-    if pending.get("type") == "file_routing_correction" and pending.get("pending_action_id"):
+    if (
+        pending.get("type") == "file_routing_correction"
+        and pending.get("pending_action_id")
+        and (pending.get("status") or "awaiting_confirmation") == "awaiting_confirmation"
+        and not pending.get("already_executed")
+    ):
         correction = pending.get("correction") or analysis.get("correction") or {}
         summary = "Routing correction prepared; awaiting your confirmation."
         prompt = pending.get("confirmation_prompt") or (
@@ -1376,7 +1561,7 @@ def _transfer(state: dict) -> tuple[str, str]:
         )
         return text, summary
     if analysis.get("kind") in {"routing_audit", "routing_investigation"}:
-    if analysis.get("consistent"):
+        if analysis.get("consistent"):
             if analysis.get("kind") == "routing_investigation":
                 mgr = (analysis.get("current_manager") or {}).get("full_name") or "not recorded"
                 appr = (analysis.get("approval_manager") or {}).get("full_name") or "not recorded"
@@ -1747,6 +1932,92 @@ def _team_roster(state: dict) -> tuple[str, str]:
     return "\n".join(line for line in lines if line), summary
 
 
+def _manager_decision_guidance_text(records: dict, *, stance: str) -> tuple[str, str]:
+    """M6/M7 approve/reject decision guidance — read-only."""
+    note = records.get("note") or ""
+    status = records.get("status")
+    if status in {"needs_request", "no_pending"}:
+        summary = records.get("note") or "No pending request selected for guidance."
+        return summary, summary
+    target = records.get("highest") or ((records.get("people") or [None])[0])
+    guidance = records.get("decision_guidance") or (target or {}).get("guidance") or {}
+    if not target:
+        return note or "No pending approval is available for guidance.", "No pending approval"
+    req_id = target.get("request_id")
+    name = target.get("full_name")
+    summary = (
+        f"Decision guidance for request {req_id} ({name}) — "
+        f"{'approval' if stance == 'approve' else 'rejection'} perspective."
+    )
+    lines = [summary, note]
+    lines.append(
+        f"Pending request: {target.get('leave_type')} {target.get('start')} to {target.get('end')} "
+        f"({target.get('business_days')} business days, status {target.get('status')}). "
+        f"Operational risk level from stored assessments: {target.get('risk_level')}."
+    )
+    policy_blocks = guidance.get("policy_violations") or []
+    if policy_blocks:
+        lines.append("Policy/eligibility issues (would remain even if coverage were fine):")
+        for item in policy_blocks:
+            lines.append(f"- {item}")
+    else:
+        lines.append(
+            "No hard policy or balance blocks were found in eligibility assessment for this window."
+        )
+    approved_ov = guidance.get("approved_overlaps") or []
+    pending_ov = guidance.get("pending_overlaps") or []
+    if approved_ov:
+        lines.append("Overlapping approved leave (committed absence):")
+        for row in approved_ov[:6]:
+            lines.append(
+                f"- {row.get('full_name')}: request {row.get('request_id')} "
+                f"{row.get('start_date')} to {row.get('end_date')} ({row.get('status')})."
+            )
+    else:
+        lines.append("No overlapping approved leave from other direct reports in this window.")
+    if pending_ov:
+        lines.append("Overlapping pending requests (not yet committed):")
+        for row in pending_ov[:6]:
+            lines.append(
+                f"- {row.get('full_name')}: request {row.get('request_id')} "
+                f"{row.get('start_date')} to {row.get('end_date')} ({row.get('status')})."
+            )
+    else:
+        lines.append("No overlapping pending_manager/pending_hr requests in this window.")
+    if guidance.get("available_pct") is not None:
+        lines.append(
+            f"Team availability estimate during the window: about {float(guidance['available_pct']):.0%} "
+            "(direct-report coverage model; below ~70% is often flagged operationally)."
+        )
+    if guidance.get("critical_conflict"):
+        lines.append("A critical project deadline intersects this leave window.")
+    if guidance.get("hr_required"):
+        lines.append("People Operations co-approval is required even after your manager decision.")
+    for risk in guidance.get("operational_risks") or target.get("risks") or []:
+        lines.append(f"Operational consideration: {risk}")
+    rec = guidance.get("recommendation") or ""
+    conf = guidance.get("confidence") or "moderate"
+    rec_map = {
+        "generally_reasonable": "The stored signals lean toward approval being reasonable, but you may still reject with a documented reason.",
+        "reasonable_with_monitoring": "Approval may be reasonable if you accept moderate staffing impact; monitor coverage.",
+        "cautious_with_coverage": "Coverage or project timing pressure argues for caution before approving.",
+        "hold_for_policy_review": "Policy or balance blocks mean approval should not proceed without fixing eligibility first.",
+        "policy_grounds_exist": "Documented policy/eligibility issues could support rejection; cite the specific block—not coverage alone.",
+        "operational_grounds_exist": "Operational coverage or project risks may support rejection, but these are not automatic policy violations.",
+        "limited_policy_grounds": "Few policy grounds were found; rejecting may need a clear operational rationale you document.",
+    }
+    lines.append(
+        f"Helios read-only suggestion ({conf} confidence): "
+        + rec_map.get(rec, "Weigh policy blocks separately from staffing overlap.")
+    )
+    lines.append(
+        "I am not instructing you to approve or reject. You are the authorized manager; "
+        "execution requires preparing a decision and confirming (Fix 17 HITL)."
+    )
+    lines.append(_cite_line(records.get("citations") or []))
+    return "\n".join(lines), summary
+
+
 def _team_analytics(state: dict) -> tuple[str, str]:
     records = state.get("analysis") or {}
     focus = records.get("focus") or "team"
@@ -1839,6 +2110,16 @@ def _team_analytics(state: dict) -> tuple[str, str]:
             lines.append("Why it is urgent: " + " ".join(reasons))
         lines.append("No approval was executed. Say prepare the approval if you want a confirmation gate.")
         return "\n".join(lines), summary
+    elif focus == "awaiting_approval_approve_guidance":
+        return _manager_decision_guidance_text(
+            {**records, "citations": state.get("citations")},
+            stance="approve",
+        )
+    elif focus == "awaiting_approval_reject_guidance":
+        return _manager_decision_guidance_text(
+            {**records, "citations": state.get("citations")},
+            stance="reject",
+        )
     elif focus == "awaiting_approval_impact":
         highest = records.get("highest") or (people[0] if people else None)
         if not highest:
@@ -2700,18 +2981,46 @@ def _org_attendance_text(records: dict, note: str) -> tuple[str, str]:
             )
         return "\n".join(lines), summary
     if records.get("focus") == "compare":
-        lines = [note]
+        summary_block = records.get("comparison_summary") or {}
+        prev = summary_block.get("previous") or {}
+        latest = summary_block.get("latest") or {}
+        lines = [note or summary_block.get("numerator", "")]
         for period in records.get("periods") or []:
             counts = period.get("counts") or {}
             lines.append(
                 f"{period.get('label')}: {period.get('start')} to {period.get('end')}. "
-                f"Present {counts.get('present', 0)}, remote {counts.get('remote', 0)}, absent {counts.get('absent', 0)}, "
-                f"distinct absent employees {counts.get('absent_employees', 0)}, "
-                f"sick {counts.get('sick', 0)}, leave {counts.get('leave', 0)}, hours {counts.get('hours', 0)}. "
-                f"The denominator is {counts.get('recorded_days', 0)} stored rows "
-                f"(absent rate {counts.get('absent_rate_pct')}%)."
+                f"Unplanned absence {counts.get('unplanned_absent', 0)} of {counts.get('recorded_days', 0)} stored rows "
+                f"({counts.get('unplanned_absence_rate_pct')}% absenteeism; absent {counts.get('absent', 0)}, sick {counts.get('sick', 0)})."
             )
-        summary = "Attendance comparison from stored rows."
+        if prev and latest and summary_block.get("rate_point_delta") is not None:
+            direction = summary_block.get("direction") or "changed"
+            delta = summary_block.get("rate_point_delta")
+            lines.append(
+                f"{prev.get('label')} absenteeism rate: {prev.get('unplanned_absence_rate_pct')}% "
+                f"({prev.get('unplanned_absent')}/{prev.get('denominator')} unplanned rows)."
+            )
+            lines.append(
+                f"{latest.get('label')} absenteeism rate: {latest.get('unplanned_absence_rate_pct')}% "
+                f"({latest.get('unplanned_absent')}/{latest.get('denominator')} unplanned rows)."
+            )
+            lines.append(
+                f"Percentage-point difference ({latest.get('label')} minus {prev.get('label')}): {delta:+.2f} pp; "
+                f"absenteeism {direction}."
+            )
+            rel = summary_block.get("relative_percent_change")
+            if summary_block.get("relative_percent_change_defined") and rel is not None:
+                lines.append(f"Relative percentage change vs {prev.get('label')}: {rel:+.2f}%.")
+            elif summary_block.get("relative_percent_change_note"):
+                lines.append(summary_block["relative_percent_change_note"])
+            summary = (
+                f"{prev.get('label')} vs {latest.get('label')}: "
+                f"{prev.get('unplanned_absence_rate_pct')}% → {latest.get('unplanned_absence_rate_pct')}% "
+                f"({delta:+.2f} pp; {direction}"
+                + (f"; relative change {rel:+.2f}%" if rel is not None else "")
+                + ")."
+            )
+        else:
+            summary = "Attendance comparison from stored rows."
         return "\n".join(lines), summary
     if records.get("focus") == "missing":
         summary = f"{records.get('people_count', 0)} employees have a missing weekday attendance row."
@@ -4615,6 +4924,31 @@ def _leave_reset(state: dict) -> tuple[str, str]:
     return "\n\n".join(lines), summary
 
 
+def _unauthorized_leave_consequence(state: dict) -> tuple[str, str]:
+    citations = state.get("citations") or []
+    lines = [
+        "Taking time off without an approved leave request is not the same as approved annual leave in the HRIS.",
+        "Until a request is submitted and approved through the normal path, those days are not confirmed leave. "
+        "They would be handled as an unplanned absence under the attendance rules, not as booked leave.",
+        "The attendance policy treats a weekday absence without prior approved leave as an unplanned absence. "
+        "You are expected to notify your line manager before 09:30 local time on that day.",
+        "Approved-in-advance leave is explicitly excluded from the unplanned-absence definition.",
+        "Leave approval policy requires the approval manager to decide before the request is confirmed. "
+        "The assistant cannot approve leave on your behalf or treat absence as approved without that workflow.",
+        "This is policy and process guidance only. No leave request was prepared, submitted, or approved.",
+    ]
+    for citation in citations[:2]:
+        lines.append(
+            f"{citation['title']} v{citation['version']} (effective {citation['effective_date']}): {citation['excerpt']}"
+        )
+    if not citations:
+        lines.append(
+            "No policy excerpt cleared the retrieval threshold; the statements above reflect standard Northstar workflow rules."
+        )
+    summary = "Unapproved leave is not confirmed in the HRIS and is treated as unplanned absence, not booked leave."
+    return "\n\n".join(lines), summary
+
+
 def _post_approval(state: dict) -> tuple[str, str]:
     facts = state.get("analysis") or {}
     threshold = facts.get("hr_day_threshold")
@@ -4651,7 +4985,13 @@ def _post_approval(state: dict) -> tuple[str, str]:
 
 
 def _policy(state: dict) -> tuple[str, str]:
+    from app.ai.context import unauthorized_leave_consequence_question
+
     kind = (state.get("analysis") or {}).get("kind")
+    if kind == "unauthorized_leave_consequence" or unauthorized_leave_consequence_question(
+        state.get("message") or ""
+    ):
+        return _unauthorized_leave_consequence(state)
     if kind == "remote_eligibility":
         return _remote_policy(state)
     if kind == "leave_reset":

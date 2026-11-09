@@ -30,6 +30,8 @@ from app.ai.tools import (
 from app.ai.context import (
     approval_inbox_followup_focus,
     approval_inbox_question,
+    org_attendance_month_comparison_question,
+    org_attendance_named_month_rate_question,
     org_transfer_followup_focus,
     parse_approval_decision,
     routing_discrepancy_question,
@@ -62,7 +64,7 @@ def deterministic_tool_plan(
     if intent == "approval_decision" or parse_approval_decision(message):
         parsed = parse_approval_decision(message) or {}
         decision = parsed.get("decision")
-        request_id = parsed.get("request_id")
+        request_id = parsed.get("request_id") or (record_context or {}).get("resolved_request_id")
         if request_id is None:
             for key in ("selected_request_id", "request_id"):
                 if inherited.get(key) is not None and inherited.get("subject") in {
@@ -86,7 +88,12 @@ def deterministic_tool_plan(
             calls.append(ToolCall("get_approval_inbox", {"status": "pending"}))
         return calls
 
-    from app.ai.context import delayed_approval_advice_question, leave_date_recommendation_question
+    from app.ai.context import (
+        advance_leave_eligibility_question,
+        delayed_approval_advice_question,
+        leave_date_recommendation_question,
+        team_leave_overlap_question,
+    )
 
     # Date-recommendation / delayed-approval advice must never open a leave draft.
     if leave_date_recommendation_question(message) or leave_focus == "recommend_dates":
@@ -97,8 +104,21 @@ def deterministic_tool_plan(
         calls.append(ToolCall("search_hr_policies", {"query": "leave approval manager People Operations co-approval"}))
         return calls
 
-    if intent in {"leave_planning", "leave_request"} or re.search(
-        r"\b(plan leave|apply for leave|book leave|request leave|take leave)\b", text
+    if intent == "leave_eligibility" or advance_leave_eligibility_question(message) or (
+        re.search(r"\b(eligib|enough (leave )?days|can i take)\b", text)
+        and re.search(r"\b(leave|annual|vacation)\b", text)
+    ):
+        calls.append(ToolCall("get_leave_balance", {"leave_type": "annual"}))
+        calls.append(ToolCall("evaluate_leave_feasibility", {}))
+        calls.append(ToolCall("search_hr_policies", {"query": message or "annual leave eligibility notice"}))
+        return calls
+
+    from app.ai.context import unauthorized_leave_consequence_question
+
+    if intent in {"leave_planning", "leave_request"} or (
+        re.search(r"\b(plan leave|apply for leave|book leave|request leave|take leave)\b", text)
+        and not advance_leave_eligibility_question(message)
+        and not unauthorized_leave_consequence_question(message)
     ):
         args: dict[str, Any] = {}
         if leave_focus:
@@ -108,15 +128,6 @@ def deterministic_tool_plan(
             calls.append(ToolCall("search_hr_policies", {"query": message}))
         return calls
 
-    if intent == "leave_eligibility" or (
-        re.search(r"\b(eligib|enough (leave )?days|can i take)\b", text)
-        and re.search(r"\b(leave|annual|vacation)\b", text)
-    ):
-        calls.append(ToolCall("get_leave_balance", {"leave_type": "annual"}))
-        calls.append(ToolCall("evaluate_leave_feasibility", {}))
-        calls.append(ToolCall("search_hr_policies", {"query": message or "annual leave eligibility notice"}))
-        return calls
-
     if intent == "leave_balance" or re.search(r"\b(leave balance|how many .*leave days|remaining (annual )?leave)\b", text):
         leave_type = "both" if re.search(r"\b(sick|both|compare)\b", text) else "annual"
         if "sick" in text and "annual" not in text:
@@ -124,15 +135,8 @@ def deterministic_tool_plan(
         calls.append(ToolCall("get_leave_balance", {"leave_type": leave_type}))
         return calls
 
-    if intent == "attendance_query" or (
-        re.search(r"\b(attendance|present|remote|late|absent)\b", text)
-        and role != "hr_admin"
-        and not re.search(r"\b(department|organization|org-wide|across)\b", text)
-    ):
-        calls.append(ToolCall("get_attendance", {"query": message}))
-        return calls
-
-    if intent == "team_conflict" or re.search(
+    # Team leave overlap must win over personal attendance when both cues appear (e.g. "absent at the same time").
+    if intent == "team_conflict" or team_leave_overlap_question(message) or re.search(
         r"\b("
         r"overlap(?:ping)? leave(?: dates?)?|"
         r"employees? .{0,40}overlap|"
@@ -145,10 +149,35 @@ def deterministic_tool_plan(
         calls.append(ToolCall("analyze_team_coverage", {"query": message}))
         return calls
 
+    if intent == "attendance_query" or (
+        re.search(r"\b(attendance|present|remote|late|absent)\b", text)
+        and role != "hr_admin"
+        and not re.search(r"\b(department|organization|org-wide|across)\b", text)
+    ):
+        calls.append(ToolCall("get_attendance", {"query": message}))
+        return calls
+
     inbox_follow = approval_inbox_followup_focus(message)
+    if (
+        intent == "team_analytics"
+        and role in {"manager", "hr_admin"}
+        and re.search(r"\bpending\b", text)
+        and re.search(r"\b(leave|request|approval)\b", text)
+        and not re.search(r"\b(coverage|overlap|conflict)\b", text)
+    ):
+        calls.append(ToolCall("get_approval_inbox", {"status": "pending"}))
+        return calls
     if intent == "team_analytics" and role in {"manager", "hr_admin"} and (
         approval_inbox_question(message)
-        or inbox_follow in {"urgency", "why_urgent", "approve_impact", "reject_impact"}
+        or inbox_follow
+        in {
+            "urgency",
+            "why_urgent",
+            "approve_impact",
+            "reject_impact",
+            "approve_guidance",
+            "reject_guidance",
+        }
     ):
         args: dict[str, Any] = {"status": "pending"}
         if inbox_follow:
@@ -170,7 +199,15 @@ def deterministic_tool_plan(
     if transfer_focus is None and hr_corrective_action_question(message):
         transfer_focus = "remediation"
     # Do not steal manager approval-inbox urgency/impact follow-ups into routing investigation.
-    if inbox_follow in {"urgency", "why_urgent", "approve_impact", "reject_impact", "prepare_approve"}:
+    if inbox_follow in {
+        "urgency",
+        "why_urgent",
+        "approve_impact",
+        "reject_impact",
+        "approve_guidance",
+        "reject_guidance",
+        "prepare_approve",
+    }:
         transfer_focus = None
     if (
         intent == "org_transfer"
@@ -201,11 +238,18 @@ def deterministic_tool_plan(
             calls.append(ToolCall("department_attendance_analytics", {"query": message, "months": 3}))
             return calls
         comparison_ask = bool(
-            re.search(r"\b(compare|versus|vs\.?|increase|decrease|contributed|change|what about)\b", text)
+            re.search(
+                r"\b(compare|versus|vs\.?|increase|decrease|contributed|change|what about|percentage change|percent change)\b",
+                text,
+            )
             or re.search(r"\b(september|october|november).{0,40}\b(september|october|november)\b", text)
         )
         if comparison_ask:
             calls.append(ToolCall("compare_date_ranges", {"query": message}))
+        elif intent == "org_attendance" and (
+            org_attendance_named_month_rate_question(message) or org_attendance_month_comparison_question(message)
+        ):
+            calls.append(ToolCall("department_attendance_analytics", {"query": message}))
         elif intent == "workforce_analytics" or (
             workforce_followup_question(message)
             and not re.search(r"\bcontributed most\b", text)
@@ -215,16 +259,23 @@ def deterministic_tool_plan(
             calls.append(ToolCall("department_attendance_analytics", {"query": message}))
         return calls
 
-    if intent in {"policy_question", "leave_policy", "general_hr"} or re.search(
-        r"\b(policy|policies|handbook|notice period)\b", text
+    if intent in {"policy_question", "leave_policy", "general_hr"} or (
+        re.search(r"\b(policy|policies|handbook|notice period)\b", text)
+        and not approval_inbox_question(message)
     ):
         calls.append(ToolCall("search_hr_policies", {"query": message}))
         return calls
 
     if intent in {"team_roster", "team_analytics"} and role in {"manager", "hr_admin"}:
+        if approval_inbox_question(message) or inbox_follow:
+            args = {"status": "pending"}
+            if inbox_follow:
+                args["focus"] = inbox_follow
+            calls.append(ToolCall("get_approval_inbox", args))
+            return calls
         # Coverage analysis is the assessment-relevant team tool; roster/analytics stay in legacy nodes
         # when this planner is not selected — still offer inbox/coverage when asked.
-        if re.search(r"\b(coverage|overlap|leave)\b", text):
+        if re.search(r"\b(coverage|overlap)\b", text) and re.search(r"\bleave\b", text):
             calls.append(ToolCall("analyze_team_coverage", {"query": message}))
             return calls
 

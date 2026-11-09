@@ -148,9 +148,12 @@ def broad_private_data_request(message: str) -> bool:
         text,
     ) and re.search(r"\b(every|all|everyone|everybody|entire|organization-wide)\b", text):
         return True
+    if re.search(r"\bprivate leave\b", text) and re.search(r"\b(every employee|all employees|everyone)\b", text):
+        return True
     private = bool(
         re.search(
-            r"\b(attendance|salar(?:y|ies)|records|database|payroll|credentials|employee data|personal information)\b",
+            r"\b(attendance|salar(?:y|ies)|records|database|payroll|credentials|employee data|personal information|"
+            r"leave balance|leave information)\b",
             text,
         )
     )
@@ -284,14 +287,14 @@ def organization_wide_request(message: str) -> bool:
             r"\b("
             r"organization-wide|organisation-wide|company-wide|"
             r"across (?:the )?(?:organization|organisation|company|northstar)|"
-            r"(?:whole|entire) (?:organization|organisation|company|directory|database|northstar|"
+            r"(?:whole|entire) (?:organization|organisation|org|company|directory|database|northstar|"
             r"employee(?:\s+database|\s+directory|\s+records?)?)|"
             r"complete (?:hr|employee) (?:database|directory|records?)|"
-            r"all employees|every employee|"
+            r"all employees|every employee|all staff|"
             r"everyone in the (?:organization|organisation|company)|"
             r"(?:every|all) departments?(?:\s+in\s+(?:northstar|the\s+(?:company|organi[sz]ation)))?|"
             r"cover (?:every|all) departments?|"
-            r"across (?:all )?departments?"
+            r"across (?:all )?(?:departments?|divisions?)"
             r")\b",
             text,
         )
@@ -310,3 +313,9 @@ def organization_wide_request(message: str) -> bool:
     if team_framed and not explicit_org:
         return False
     return explicit_org or everyone_org
+
+
+def manager_requested_organization_scope(*texts: str) -> bool:
+    """True when any supplied user/rewritten text explicitly requests organization-wide scope."""
+    combined = " ".join(part.strip() for part in texts if part and part.strip())
+    return bool(combined) and organization_wide_request(combined)

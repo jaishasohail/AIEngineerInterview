@@ -559,8 +559,19 @@ def parse_comparison(
     """Split a comparison into windows. Listed months and last-N-months become one window each."""
     today = today or org_today()
     text = message.lower()
-    if not re.search(r"\b(compare|comparison|versus|vs\.?|compared)\b", text):
+    change_ask = bool(
+        re.search(
+            r"\b(percentage change|percent change|change from|change between)\b",
+            text,
+        )
+        or re.search(r"\bhow much did .{0,50} change\b", text)
+    )
+    compare_cue = bool(re.search(r"\b(compare|comparison|versus|vs\.?|compared)\b", text))
+    if not compare_cue and not change_ask:
         return None
+    if change_ask and not compare_cue:
+        listed = parse_named_month_periods(message, today)
+        return listed if len(listed) >= 2 else None
     # "Compare those two …" after a month switch: use prior_window + current window.
     if inherited and re.search(r"\b(those two|the two|both (?:months|periods|windows|counts))\b", text):
         prior = inherited.get("prior_window") or {}
@@ -1905,6 +1916,11 @@ def _approval_details(db: Session, request_ids: list[int]) -> dict[int, list[dic
 def _leave_question(text: str) -> str:
     if re.search(r"\bwho approved\b", text):
         return "who"
+    if re.search(
+        r"\b(was|were|did|has|have)\b.{0,60}\b(submit|submitted|filed|sent)\b",
+        text,
+    ):
+        return "submitted"
     if re.search(r"\b(has|have)\b", text) and re.search(r"\breject", text):
         return "rejected"
     if re.search(r"\b(has|have|been)\b", text) and re.search(r"\bapprov", text):
@@ -1932,6 +1948,59 @@ def leave_status_report(
     inherited_id = None
     if inherited and inherited.get("subject") == "leave_history":
         inherited_id = inherited.get("request_id")
+    if question == "submitted":
+        report_filter = "latest"
+        if inherited_id:
+            rows = base.filter(LeaveRequest.id == int(inherited_id)).limit(1).all()
+        else:
+            rows = (
+                base.order_by(LeaveRequest.submitted_at.desc().nullslast(), LeaveRequest.id.desc())
+                .limit(1)
+                .all()
+            )
+        approvals = _approval_details(db, [row.id for row in rows])
+        manager_ids = {row.routed_manager_id for row in rows if row.routed_manager_id}
+        managers = {
+            row.id: row.full_name
+            for row in db.query(Employee).filter(Employee.id.in_(manager_ids)).all()
+        } if manager_ids else {}
+        by_status: dict[str, int] = {row.status: 1 for row in rows}
+        return {
+            "kind": "leave_request_status",
+            "focus": "latest",
+            "employee_id": employee_id,
+            "timezone": org_timezone_name(),
+            "as_of": today.isoformat(),
+            "filter": report_filter,
+            "question": question,
+            "request_count": request_count,
+            "changed": False,
+            "advice": None,
+            "by_status": {
+                "approved": by_status.get("approved", 0),
+                "rejected": by_status.get("rejected", 0),
+                "pending": sum(n for s, n in by_status.items() if "pending" in s),
+                "pending_manager": by_status.get("pending_manager", 0),
+                "pending_hr": by_status.get("pending_hr", 0),
+                "cancelled": by_status.get("cancelled", 0),
+                "raw": by_status,
+            },
+            "requests": [
+                {
+                    "id": row.id,
+                    "leave_type": row.leave_type,
+                    "start": row.start_date.isoformat(),
+                    "end": row.end_date.isoformat(),
+                    "status": row.status,
+                    "business_days": row.business_days,
+                    "submitted_at": row.submitted_at.isoformat() if row.submitted_at else "",
+                    "assigned_approver_id": row.routed_manager_id,
+                    "assigned_approver": managers.get(row.routed_manager_id) if row.routed_manager_id else None,
+                    "approvals": approvals.get(row.id) or [],
+                }
+                for row in rows
+            ],
+        }
     asks_latest_approved = bool(
         (
             re.search(r"\b(latest|most recent|last)\s+approved\b", text)
@@ -2263,6 +2332,34 @@ def parse_leave_dates(message: str, today: date | None = None) -> dict | None:
     if re.search(r"\btomorrow\b", text) and re.search(r"\b(sick|leave|request)\b", text):
         day = today + timedelta(days=1)
         return _pack(day, day)
+
+    # Relative start anchors for eligibility / planning ("two weeks from now", "next month").
+    rel_weeks = re.search(
+        r"\b(?:in\s+)?(?:for\s+)?(one|two|three|four|five|six|seven|eight|nine|ten|\d+)\s+weeks?\s+"
+        r"(?:from\s+(?:now|today)|later|hence)\b",
+        text,
+    )
+    if rel_weeks and re.search(r"\b(leave|off|vacation|absent|eligible|allowed|take)\b", text):
+        token = rel_weeks.group(1)
+        weeks = _month_count(token) if token.isalpha() else int(token)
+        if weeks:
+            start = today + timedelta(days=7 * weeks)
+            while start.weekday() >= 5:
+                start += timedelta(days=1)
+            return _pack(_upcoming(start, today), None)
+    if re.search(r"\bnext month\b", text) and re.search(r"\b(leave|off|vacation|absent|request|eligible)\b", text):
+        from app.clock import next_month_bounds
+
+        month_start, _month_end = next_month_bounds(today)
+        return _pack(month_start, None)
+    return None
+
+
+def parse_relative_leave_start(message: str, today: date | None = None) -> date | None:
+    """Earliest proposed leave start from relative phrasing; does not infer duration."""
+    parsed = parse_leave_dates(message, today=today)
+    if parsed and parsed.get("start"):
+        return parsed["start"]
     return None
 
 

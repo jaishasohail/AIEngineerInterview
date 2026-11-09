@@ -7,7 +7,7 @@ from fastapi.responses import JSONResponse
 
 from app.access import AuthorizationError
 from app.ai.embeddings import EmbeddingUnavailable
-from app.ai.runtime import get_graph, reset_graph
+from app.ai.runtime import checkpoint_store_backend, get_graph, reset_graph
 from app.api.routes import router
 from app.config import get_settings
 from app.database import (
@@ -43,6 +43,7 @@ async def lifespan(_app: FastAPI):
         upgrade_postgres()
     reset_graph()
     get_graph()
+    logger.info("LangGraph checkpoint store: %s", checkpoint_store_backend())
     logger.disabled = False
     if settings.auto_seed:
         db = next(session_scope())

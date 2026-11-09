@@ -516,7 +516,10 @@ def conversation_detail(conversation_id: int, user: User = Depends(get_current_u
 def chat(body: ChatIn, request: Request, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict:
     conversation = _conversation_for(db, user, body.conversation_id, body.message)
     add_message(db, conversation, "user", body.message.strip())
-    payload = run_turn(db, user, conversation, body.message.strip(), ip=client_ip(request))
+    try:
+        payload = run_turn(db, user, conversation, body.message.strip(), ip=client_ip(request))
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     add_message(db, conversation, "assistant", payload["message"], json_safe(payload))
     db.commit()
     return payload

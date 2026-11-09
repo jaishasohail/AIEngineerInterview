@@ -361,30 +361,11 @@ def _approval_visible(user: User, actor: Employee, approval: Approval) -> bool:
 
 
 def _resolve_approval(db: Session, *, request_id: int | None, approval_id: int | None) -> Approval | None:
-    if approval_id is not None:
-        found = db.get(Approval, int(approval_id))
-        if found is not None:
-            return found
-    if request_id is None:
-        return None
-    leave = db.get(LeaveRequest, int(request_id))
-    if leave is not None:
-        pending = (
-            db.query(Approval)
-            .filter(Approval.leave_request_id == leave.id, Approval.status == "pending")
-            .order_by(Approval.stage.asc(), Approval.id.asc())
-            .first()
-        )
-        if pending is not None:
-            return pending
-        # Prefer the latest approval row so callers can explain already-decided cases.
-        return (
-            db.query(Approval)
-            .filter(Approval.leave_request_id == leave.id)
-            .order_by(Approval.id.desc())
-            .first()
-        )
-    return db.get(Approval, int(request_id))
+    from app.access import resolve_leave_approval_reference
+
+    return resolve_leave_approval_reference(
+        db, request_id=request_id, approval_id=approval_id, pending_only=False
+    )
 
 
 def execute_tool(
@@ -699,9 +680,29 @@ def _get_attendance(db, user, employee, args, *, message="", inherited=None, **_
 
 
 def _analyze_team_coverage(db, user, employee, args, *, message="", **_kwargs) -> dict:
+    from app.services.leave_engine import resolve_team_overlap_window
+
     if user.role not in {"manager", "hr_admin"}:
         raise AuthorizationError("Team coverage analysis is limited to managers and HR administrators.", resource="team")
-    analysis = analyze_team(db, employee)
+    window_start, window_end, window_label, window_err = resolve_team_overlap_window(message or "")
+    if window_err:
+        return {
+            "kind": "team_conflict",
+            **window_err,
+            "summary": window_err.get("message", "Clarify the overlap review window."),
+            "state_patch": {
+                "analysis": {"kind": "team_conflict", **window_err},
+                "intent": "team_conflict",
+            },
+        }
+    analysis = analyze_team(
+        db,
+        employee,
+        filter_start=window_start,
+        filter_end=window_end,
+        filter_label=window_label or None,
+        message=message or "",
+    )
     pair_count = len(analysis.get("overlap_pairs") or [])
     request_count = len(analysis.get("requests") or [])
     if pair_count:
@@ -749,6 +750,10 @@ def _get_approval_inbox(db, user, employee, args, *, message="", inherited=None,
             report_message = "What happens if I approve it?"
         elif follow_focus == "reject_impact":
             report_message = "What happens if I reject it?"
+        elif follow_focus == "approve_guidance":
+            report_message = message or "Should I approve this leave request?"
+        elif follow_focus == "reject_guidance":
+            report_message = message or "Should I reject this leave request?"
         analysis = team_analytics_report(db, employee, report_message, inherited or {})
         selected_id = analysis.get("selected_request_id")
         if selected_id is None and (analysis.get("highest") or {}).get("request_id"):
@@ -774,7 +779,7 @@ def _get_approval_inbox(db, user, employee, args, *, message="", inherited=None,
         # Keep the richer team_analytics analysis for narration, while preserving inbox rows.
         analysis = {
             **analysis,
-            "kind": analysis.get("kind") or "team_analytics",
+            "kind": "approval_inbox",
             "status_filter": status,
             "count": int(analysis.get("people_count") or len(rows)),
             "display_limit": display_limit,
@@ -852,17 +857,49 @@ def _get_approval_inbox(db, user, employee, args, *, message="", inherited=None,
 
 
 def _execute_approval(db, user, employee, args, *, message="", ip=None, **_kwargs) -> dict:
-    from app.access import can_decide_approval
-    from app.ai.context import get_ctx
+    from app.access import approval_decision_access
+    from app.ai.context import find_mentioned, get_ctx
+    from app.services.approval_resolution import nl_approval_resolution
     from app.services.confirmation import prepare_decision_pending
 
     request_id = args.get("request_id")
     approval_id = args.get("approval_id")
-    approval = _resolve_approval(
-        db,
-        request_id=int(request_id) if request_id is not None else None,
-        approval_id=int(approval_id) if approval_id is not None else None,
-    )
+    rid = int(request_id) if request_id is not None else None
+    aid = int(approval_id) if approval_id is not None else None
+    if rid is None and aid is None and (message or "").strip():
+        mentioned = find_mentioned(db, message, employee.id)
+        resolution, _parsed = nl_approval_resolution(
+            db, user, employee, message, [m.id for m in mentioned]
+        )
+        if resolution:
+            if resolution["status"] == "clarify":
+                return {
+                    "kind": "approval_decision",
+                    "tool_status": "clarify",
+                    "status": "needs_clarification",
+                    "message": resolution.get("message") or "",
+                    "summary": "Clarify which leave request.",
+                }
+            if resolution["status"] in {"not_found", "unauthorized"}:
+                return {
+                    "kind": "approval_decision",
+                    "tool_status": "denied",
+                    "status": "denied",
+                    "message": resolution.get("message") or "",
+                    "summary": "Approval denied by authorization.",
+                }
+            if resolution["status"] == "resolved":
+                rid = int(resolution["request_id"])
+    ok, gate_reason = approval_decision_access(db, user, request_id=rid, approval_id=aid)
+    if not ok:
+        return {
+            "kind": "approval_decision",
+            "tool_status": "denied",
+            "status": "denied",
+            "message": gate_reason,
+            "summary": "Approval denied by authorization.",
+        }
+    approval = _resolve_approval(db, request_id=rid, approval_id=aid)
     if approval is None:
         return {
             "kind": "approval_decision",
@@ -934,10 +971,40 @@ def _execute_approval(db, user, employee, args, *, message="", ip=None, **_kwarg
     }
 
 
-def _execute_rejection(db, user, employee, args, *, ip=None, **_kwargs) -> dict:
-    from app.access import can_decide_approval
-    from app.ai.context import get_ctx
+def _execute_rejection(db, user, employee, args, *, message="", ip=None, **_kwargs) -> dict:
+    from app.access import approval_decision_access, can_decide_approval
+    from app.ai.context import find_mentioned, get_ctx
+    from app.services.approval_resolution import nl_approval_resolution
     from app.services.confirmation import prepare_decision_pending
+
+    request_id = args.get("request_id")
+    approval_id = args.get("approval_id")
+    rid = int(request_id) if request_id is not None else None
+    aid = int(approval_id) if approval_id is not None else None
+    if rid is None and aid is None and (message or "").strip():
+        mentioned = find_mentioned(db, message, employee.id)
+        resolution, _parsed = nl_approval_resolution(
+            db, user, employee, message, [m.id for m in mentioned]
+        )
+        if resolution:
+            if resolution["status"] == "clarify":
+                return {
+                    "kind": "approval_decision",
+                    "tool_status": "clarify",
+                    "status": "needs_clarification",
+                    "message": resolution.get("message") or "",
+                    "summary": "Clarify which leave request.",
+                }
+            if resolution["status"] in {"not_found", "unauthorized"}:
+                return {
+                    "kind": "approval_decision",
+                    "tool_status": "denied",
+                    "status": "denied",
+                    "message": resolution.get("message") or "",
+                    "summary": "Rejection denied by authorization.",
+                }
+            if resolution["status"] == "resolved":
+                rid = int(resolution["request_id"])
 
     reason = (args.get("reason") or "").strip()
     if not reason:
@@ -949,14 +1016,19 @@ def _execute_rejection(db, user, employee, args, *, ip=None, **_kwargs) -> dict:
             "missing_args": ["reason"],
             "message": "A rejection reason is required.",
             "summary": "Rejection reason required.",
+            "request_id": rid,
+            "summary_context": {"request_id": rid},
         }
-    request_id = args.get("request_id")
-    approval_id = args.get("approval_id")
-    approval = _resolve_approval(
-        db,
-        request_id=int(request_id) if request_id is not None else None,
-        approval_id=int(approval_id) if approval_id is not None else None,
-    )
+    ok, gate_reason = approval_decision_access(db, user, request_id=rid, approval_id=aid)
+    if not ok:
+        return {
+            "kind": "approval_decision",
+            "tool_status": "denied",
+            "status": "denied",
+            "message": gate_reason,
+            "summary": "Rejection denied by authorization.",
+        }
+    approval = _resolve_approval(db, request_id=rid, approval_id=aid)
     if approval is None:
         return {
             "kind": "approval_decision",
@@ -1036,14 +1108,28 @@ def _department_attendance_analytics(db, user, employee, args, *, message="", in
     # Never append model-invented department filters — that silently shrinks org-wide counts.
     # Managers/employees must never hit the organization attendance report; scope is applied
     # inside absence_analytics before attendance rows are loaded.
-    from app.ai.context import workforce_analytics_focus, workforce_followup_question
+    from app.ai.context import (
+        org_attendance_month_comparison_question,
+        org_attendance_named_month_rate_question,
+        workforce_analytics_focus,
+        workforce_followup_question,
+    )
 
     query = message or args.get("query") or ""
     months = int(args.get("months") or 3)
     inherited = inherited or {}
-    use_scoped_analytics = user.role != "hr_admin" or workforce_followup_question(query) or (
-        re.search(r"\b(pattern|recommend|concern|trend|workforce)\b", query, re.I)
-        and not re.search(r"\b(how many|september|october|november|absent employees)\b", query, re.I)
+    org_month_ask = org_attendance_named_month_rate_question(query) or org_attendance_month_comparison_question(
+        query
+    )
+    use_scoped_analytics = user.role != "hr_admin" or (
+        not org_month_ask
+        and (
+            workforce_followup_question(query)
+            or (
+                re.search(r"\b(pattern|recommend|concern|trend|workforce)\b", query, re.I)
+                and not re.search(r"\b(how many|september|october|november|absent employees)\b", query, re.I)
+            )
+        )
     )
     if use_scoped_analytics:
         payload = absence_analytics(db, user, months=months)

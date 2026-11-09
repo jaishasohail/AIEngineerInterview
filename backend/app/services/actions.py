@@ -4,7 +4,7 @@ from datetime import date
 
 from sqlalchemy.orm import Session
 
-from app.access import AuthorizationError, can_decide_approval, employee_for_user
+from app.access import AuthorizationError, approval_decision_access, can_decide_approval, employee_for_user
 from app.audit import write_audit
 from app.clock import org_today, utcnow
 from app.models import Approval, Employee, LeaveBalance, LeaveRequest, User
@@ -138,6 +138,15 @@ def submit_leave(
     }
 
 
+def routing_correction_still_needed(db: Session, subject_id: int) -> bool:
+    """True when the employee still has a manager_id / approval_manager_id mismatch."""
+    subject = db.get(Employee, int(subject_id))
+    if subject is None:
+        return False
+    finding = investigate_routing(db, subject)
+    return not finding.get("consistent") and finding.get("correction") is not None
+
+
 def file_routing_correction(
     db: Session,
     actor: User,
@@ -213,6 +222,15 @@ def file_routing_correction(
         .one_or_none()
     )
     if existing:
+        if actor.role == "hr_admin":
+            return decide_approval(
+                db,
+                actor,
+                existing.id,
+                "approve",
+                note="Routing correction applied by People Operations (existing request).",
+                ip_address=ip_address,
+            )
         return {
             "status": "submitted",
             "message": (
@@ -254,6 +272,15 @@ def file_routing_correction(
         commit=False,
     )
     db.commit()
+    if actor.role == "hr_admin":
+        return decide_approval(
+            db,
+            actor,
+            approval.id,
+            "approve",
+            note="Routing correction applied by People Operations.",
+            ip_address=ip_address,
+        )
     return {
         "status": "submitted",
         "message": (
@@ -285,20 +312,21 @@ def decide_approval(
     approval = db.get(Approval, approval_id)
     if approval is None:
         raise AuthorizationError("Approval not found.", resource=f"approval:{approval_id}", action="decide")
-    if approval.status != "pending":
-        raise AuthorizationError("This approval is no longer pending.", resource=f"approval:{approval_id}", action="decide")
-    if not _can_decide(actor, approval):
+    ok, gate_reason = approval_decision_access(
+        db, actor, approval_id=approval.id, request_id=approval.leave_request_id
+    )
+    if not ok:
         write_audit(
             db,
             actor_user_id=actor.id,
             action="approval_decide",
             resource_type="approval",
-            resource_id=str(approval.id),
+            resource_id=str(approval_id),
             outcome="denied",
-            details={"decision": decision},
+            details={"decision": decision, "reason": gate_reason},
             ip_address=ip_address,
         )
-        raise AuthorizationError("You are not the assigned approver for this request.", resource=f"approval:{approval.id}", action="decide")
+        raise AuthorizationError(gate_reason, resource=f"approval:{approval_id}", action="decide")
 
     now = utcnow()
     approval.status = "approved" if decision == "approve" else "rejected"
@@ -535,4 +563,52 @@ def _decide_correction(db: Session, actor: User, approval: Approval, decision: s
         "status": "approved",
         "message": f"Approval routing for {employee.full_name} now points to {target.full_name}. Open manager-stage requests were moved with it.",
         "approval_id": approval.id,
+    }
+
+
+def record_hr_corrective_recommendation(
+    db: Session,
+    actor: User,
+    *,
+    proposal: dict,
+    pending_action_id: int | None = None,
+    ip_address: str | None = None,
+) -> dict:
+    """Persist an advisory HR corrective recommendation. No HRIS tables are mutated."""
+    if actor.role != "hr_admin":
+        raise AuthorizationError(
+            "Only HR administrators can record organization-wide corrective recommendations.",
+            resource="workforce_corrective",
+            action="record",
+        )
+    dept = proposal.get("target_department") or "the selected department"
+    recorded_at = utcnow().isoformat()
+    recommendation_id = f"hr-corrective-{pending_action_id or 0}-{recorded_at}"
+    write_audit(
+        db,
+        actor_user_id=actor.id,
+        action="hr_corrective_recommendation_recorded",
+        resource_type="hr_corrective_recommendation",
+        resource_id=recommendation_id,
+        outcome="success",
+        details={
+            "pending_action_id": pending_action_id,
+            "proposal": proposal,
+            "advisory_only": True,
+            "external_hris_mutation": False,
+        },
+        ip_address=ip_address,
+        commit=False,
+    )
+    db.flush()
+    return {
+        "status": "recorded",
+        "advisory_only": True,
+        "recommendation_id": recommendation_id,
+        "message": (
+            f"Recorded HR corrective recommendation for {dept}. This is an advisory entry in Helios "
+            "audit history only — no employee or attendance records were changed in PostgreSQL."
+        ),
+        "summary": "Advisory corrective recommendation recorded (no HRIS mutation).",
+        "proposal": proposal,
     }

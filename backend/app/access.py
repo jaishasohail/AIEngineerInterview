@@ -2,7 +2,7 @@
 
 from sqlalchemy.orm import Session
 
-from app.models import Approval, Employee, User
+from app.models import Approval, Employee, LeaveRequest, User
 
 SENSITIVE_SALARY = "salary"
 SENSITIVE_PERFORMANCE = "performance"
@@ -112,6 +112,88 @@ def can_decide_approval(actor: User, approval: Approval) -> bool:
     if actor.role != "manager":
         return False
     return actor.employee_id is not None and actor.employee_id == approval.approver_employee_id
+
+
+def resolve_leave_approval_reference(
+    db: Session,
+    *,
+    request_id: int | None = None,
+    approval_id: int | None = None,
+    pending_only: bool = False,
+) -> Approval | None:
+    """Resolve an Approval row for approve/reject flows.
+
+    When ``request_id`` is set it always refers to ``leave_requests.id``, never an approval id.
+    """
+    if approval_id is not None:
+        row = db.get(Approval, int(approval_id))
+        if row is None:
+            return None
+        if pending_only and row.status != "pending":
+            return None
+        return row
+    if request_id is None:
+        return None
+    leave = db.get(LeaveRequest, int(request_id))
+    if leave is None:
+        return None
+    pending = (
+        db.query(Approval)
+        .filter(Approval.leave_request_id == leave.id, Approval.status == "pending")
+        .order_by(Approval.stage.asc(), Approval.id.asc())
+        .first()
+    )
+    if pending is not None:
+        return pending
+    if pending_only:
+        return None
+    return (
+        db.query(Approval)
+        .filter(Approval.leave_request_id == leave.id)
+        .order_by(Approval.id.desc())
+        .first()
+    )
+
+
+def approval_decision_access(
+    db: Session,
+    actor: User,
+    *,
+    request_id: int | None = None,
+    approval_id: int | None = None,
+) -> tuple[bool, str]:
+    """Authoritative gate for chat and REST before preparing or executing a decision.
+
+    When both ids are omitted the caller may still need clarification (allowed).
+    """
+    if actor.role == "employee":
+        return (
+            False,
+            "Employees cannot approve or reject leave requests, including their own. "
+            "Approval decisions are limited to the assigned manager or an HR administrator.",
+        )
+    if actor.role not in {"manager", "hr_admin"}:
+        return False, "Only managers and HR administrators can approve or reject leave requests."
+    if request_id is None and approval_id is None:
+        return True, ""
+    approval = resolve_leave_approval_reference(
+        db, request_id=request_id, approval_id=approval_id, pending_only=True
+    )
+    if approval is None:
+        if request_id is not None:
+            leave = db.get(LeaveRequest, int(request_id))
+            if leave is None:
+                return False, f"Leave request {request_id} was not found."
+        return False, "No pending approval was found for that leave request."
+    if approval.status != "pending":
+        return False, f"Approval {approval.id} is already {approval.status} and cannot be decided again."
+    if not can_decide_approval(actor, approval):
+        return (
+            False,
+            "You are not authorized to approve or reject this leave request. "
+            "Managers may only decide requests assigned to them within their reporting scope.",
+        )
+    return True, ""
 
 
 def scoped_employee_ids(db: Session, actor: User, actor_employee: Employee) -> list[int] | None:

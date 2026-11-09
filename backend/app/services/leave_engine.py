@@ -3,6 +3,7 @@
 The model may explain these results. It does not calculate them and it cannot approve them.
 """
 
+import re
 from datetime import date, timedelta
 
 from sqlalchemy.orm import Session
@@ -597,26 +598,111 @@ def _team_leave_overlap_pairs(
     return pairs
 
 
-def analyze_team(db: Session, manager: Employee) -> dict:
+def resolve_team_overlap_window(message: str) -> tuple[date | None, date | None, str, dict | None]:
+    """Parse an optional calendar-month window for manager overlap analysis."""
+    import calendar
+    import re
+
+    from app.services.records import parse_named_month_periods
+
+    text = message or ""
+    if re.search(r"\bnext month\b", text, re.I):
+        today = org_today()
+        year = today.year + (1 if today.month == 12 else 0)
+        month = 1 if today.month == 12 else today.month + 1
+        start = date(year, month, 1)
+        end = date(year, month, calendar.monthrange(year, month)[1])
+        label = start.strftime("%B %Y")
+        return start, end, label, None
+
+    periods = parse_named_month_periods(text)
+    if not periods:
+        return None, None, "", None
+    if len(periods) > 1:
+        return (
+            None,
+            None,
+            "",
+            {
+                "status": "needs_clarification",
+                "message": "Name one calendar month to review for overlapping leave (for example: December 2026).",
+            },
+        )
+    start, end, label = periods[0]
+    today = org_today()
+    if not re.search(r"\b(19|20)\d{2}\b", text):
+        # "December" in November should mean upcoming December this year, not last calendar year.
+        if start.year < today.year and start.month > today.month:
+            year = today.year
+            start = date(year, start.month, 1)
+            end = date(year, start.month, calendar.monthrange(year, start.month)[1])
+            label = start.strftime("%B %Y")
+    if start.year < 2000 or start.year > 2100:
+        return (
+            None,
+            None,
+            "",
+            {
+                "status": "invalid",
+                "message": f"The year {start.year} is outside the supported calendar range for overlap review.",
+            },
+        )
+    return start, end, label, None
+
+
+def _team_overlap_status_filter(message: str) -> set[str] | None:
+    text = (message or "").lower()
+    wants_pending = bool(re.search(r"\bpending\b", text))
+    wants_approved = bool(re.search(r"\bapproved\b", text))
+    if wants_pending and not wants_approved:
+        return {"pending_manager", "pending_hr"}
+    if wants_approved and not wants_pending:
+        return {"approved"}
+    return None
+
+
+def analyze_team(
+    db: Session,
+    manager: Employee,
+    *,
+    filter_start: date | None = None,
+    filter_end: date | None = None,
+    filter_label: str | None = None,
+    message: str = "",
+) -> dict:
     members = team_members(db, manager.id)
     member_ids = [member.id for member in members]
     today = org_today()
     horizon = today + timedelta(days=75)
+    range_start = filter_start or today
+    range_end = filter_end or horizon
+    if filter_end is not None:
+        horizon = max(horizon, filter_end)
     requests = (
         db.query(LeaveRequest, Employee)
         .join(Employee, Employee.id == LeaveRequest.employee_id)
         .filter(
             LeaveRequest.employee_id.in_(member_ids or [0]),
             LeaveRequest.status.in_(OPEN_STATUSES),
-            LeaveRequest.end_date >= today,
-            LeaveRequest.start_date <= horizon,
+            LeaveRequest.end_date >= range_start,
+            LeaveRequest.start_date <= range_end,
         )
         .all()
     )
+    if filter_start and filter_end:
+        requests = [
+            (leave, person)
+            for leave, person in requests
+            if leave.start_date <= filter_end and leave.end_date >= filter_start
+        ]
+    status_filter = _team_overlap_status_filter(message)
+    if status_filter:
+        requests = [(leave, person) for leave, person in requests if leave.status in status_filter]
     overlap_pairs = _team_leave_overlap_pairs(requests, team_size=len(members))
+    scan_from = filter_start if filter_start is not None else today
     clusters: dict[date, list] = {}
     for request, employee in requests:
-        cursor = max(request.start_date, today)
+        cursor = max(request.start_date, scan_from)
         while cursor <= request.end_date:
             if cursor.weekday() < 5:
                 key = _week_start(cursor)
@@ -626,6 +712,8 @@ def analyze_team(db: Session, manager: Employee) -> dict:
     ranked = sorted(clusters.items(), key=lambda item: (-len(item[1]), item[0]))
     if ranked:
         week, bucket = ranked[0]
+    elif filter_start is not None:
+        week, bucket = _week_start(filter_start), {}
     else:
         week, bucket = _week_start(today + timedelta(days=30)), {}
     week_end = week + timedelta(days=4)
@@ -690,13 +778,18 @@ def analyze_team(db: Session, manager: Employee) -> dict:
         if selected or overlap_pairs
         else "low"
     )
+    window_payload = (
+        {"start": filter_start.isoformat(), "end": filter_end.isoformat(), "label": filter_label or "selected month"}
+        if filter_start is not None and filter_end is not None
+        else {"start": week.isoformat(), "end": week_end.isoformat(), "label": f"week of {format_day(week)}"}
+    )
     return {
         "kind": "team_conflict",
         "focus": "overlap",
         "manager": _person(manager),
         "team_size": team_size,
         "scope": "direct_reports",
-        "window": {"start": week.isoformat(), "end": week_end.isoformat(), "label": f"week of {format_day(week)}"},
+        "window": window_payload,
         "requests": selected,
         "overlap_pairs": overlap_pairs,
         "overlap_count": len(overlap_pairs),
@@ -715,7 +808,7 @@ def analyze_team(db: Session, manager: Employee) -> dict:
         "risk_level": risk_level,
         "rules_applied": [
             "Scope is limited to employees where manager_id matches the signed-in manager (or HR org-wide team scan).",
-            "Only pending_manager, pending_hr, and approved leave requests are compared.",
+            "Only pending_manager, pending_hr, and approved leave requests are compared; pending is not treated as confirmed absence.",
             "An overlap is two different employees whose leave date ranges intersect.",
             "Availability is team size minus distinct people out on overlapping leave.",
             "No attendance analytics or organization-wide absence rates are used.",

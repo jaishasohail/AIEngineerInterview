@@ -728,4 +728,12 @@ def intent_from_spec(spec: QuerySpec, *, role: str) -> str | None:
 
 def interpret_and_validate(message: str, *, role: str = "employee", inherited: dict | None = None) -> QuerySpec:
     """Build a QuerySpec then apply contradiction / completeness validation."""
+    from app.ai.context import approval_inbox_question
+
+    if role in {"manager", "hr_admin"} and approval_inbox_question(message):
+        spec = QuerySpec()
+        spec.domain = "team"
+        spec.scope = "team"
+        spec.intent_hint = "team_analytics"
+        return validate_query_spec(spec, message, role=role)
     return validate_query_spec(interpret_query(message, role=role, inherited=inherited), message, role=role)

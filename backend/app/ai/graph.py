@@ -17,23 +17,35 @@ from langgraph.types import RetryPolicy, interrupt
 
 from app.ai.context import (
     _explicit_leave_request,
+    advance_leave_eligibility_question,
     ambiguous_team_or_org_scope,
     approval_inbox_followup_focus,
     approval_inbox_question,
     classify_with_model,
     continuation_intent,
     delayed_approval_advice_question,
+    subject_employee_pronoun_followup,
+    employee_self_approval_question,
     explicit_routing_correction_request,
     find_mentioned,
     get_ctx,
     hypothetical_remaining_days,
     is_clarification_reply,
     leave_date_recommendation_question,
+    leave_history_record_context,
     leave_plan_followup,
+    leave_plan_thread_active,
+    leave_planning_continuation_message,
     load_actor,
     manager_team_ops_question,
+    manager_leave_decision_guidance_question,
+    managed_leave_request_status_id,
+    named_employee_identity_question,
     org_transfer_followup_focus,
     organization_intent,
+    org_attendance_month_comparison_question,
+    org_attendance_named_month_rate_question,
+    hr_workforce_risk_analytics_question,
     parse_approval_decision,
     parse_business_days,
     personal_leave_status_question,
@@ -41,7 +53,11 @@ from app.ai.context import (
     profile_for,
     hr_corrective_action_question,
     record_consistency_question,
+    workforce_attendance_corrective_question,
+    workforce_corrective_thread_prepare,
+    workforce_corrective_prepare_question,
     remote_policy_question,
+    unauthorized_leave_consequence_question,
     requested_leave_days,
     routing_discrepancy_question,
     rule_intent,
@@ -53,6 +69,7 @@ from app.ai.guard import (
     broad_private_data_request,
     detect_injection,
     hard_security_violation,
+    manager_requested_organization_scope,
     organization_wide_request,
     other_employee_private_request,
     out_of_hierarchy_request,
@@ -81,8 +98,9 @@ from app.services.confirmation import (
     prepare_decision_pending,
     prepare_routing_pending,
     prepare_submit_leave_pending,
+    prepare_workforce_corrective_pending,
 )
-from app.services.analytics_engine import absence_analytics
+from app.services.analytics_engine import absence_analytics, workforce_corrective_proposal
 from app.services.hr_ops import run_hr_report
 from app.services.leave_engine import (
     analyze_team,
@@ -111,11 +129,9 @@ from app.services.records import (
 _REQUEST_INTENTS = {"leave_planning", "leave_request"}
 _TOOL_ORCHESTRATED_INTENTS = {
     "leave_balance",
-    "leave_eligibility",
     "attendance_query",
     "holiday_query",
     "team_conflict",
-    "approval_decision",
     "org_attendance",
     # workforce_analytics uses the dedicated graph node so follow-up focuses differ.
     "org_transfer",
@@ -136,6 +152,7 @@ class HRState(TypedDict, total=False):
     intent: str
     orchestration_mode: str
     injection_flag: bool
+    requested_org_wide: bool
     authorized: bool
     denial_reason: str
     security_decision: dict | None
@@ -188,6 +205,18 @@ def classify_intent(state: HRState) -> dict:
     injections = detect_injection(security_text)
     kinds = sensitive_kinds(security_text)
     mentioned = find_mentioned(ctx.db, security_text, employee.id)
+    inherited_for_targets = state.get("record_context") or {}
+    if (
+        not mentioned
+        and subject_employee_pronoun_followup(message)
+        and inherited_for_targets.get("subject_employee_id") is not None
+        and inherited_for_targets.get("user_id") in {None, user.id}
+    ):
+        from app.models import Employee as EmployeeModel
+
+        subject_row = ctx.db.get(EmployeeModel, int(inherited_for_targets["subject_employee_id"]))
+        if subject_row is not None and subject_row.id != employee.id:
+            mentioned = [subject_row]
     bulk = wants_bulk_export(security_text)
     ruled = rule_intent(message, mentioned_other=bool(mentioned), kinds=kinds, bulk=bulk)
     mode = "deterministic"
@@ -197,6 +226,10 @@ def classify_intent(state: HRState) -> dict:
     # message instead of letting the benign half pick the intent. It never grants access.
     security = assess_security(security_text, role=user.role, mentioned_other=bool(mentioned))
     security_audit = security.as_audit() if security.denied else None
+    requested_org_wide = user.role == "manager" and manager_requested_organization_scope(
+        security_text,
+        message,
+    )
     # Hard security probes always win. Broad org analytics are role-gated: HR Admin may ask
     # organization-wide questions; other roles are denied before retrieval.
     hr_employee_delete = bool(
@@ -206,6 +239,23 @@ def classify_intent(state: HRState) -> dict:
     )
     if security.denied:
         intent = security.intent
+        violation = True
+    elif requested_org_wide:
+        # Bind authorization to the original requested scope before intent routing can
+        # remap a workforce request to team analytics.
+        intent = "unauthorized_access"
+        violation = True
+    elif user.role == "employee" and re.search(
+        r"\b(organization[- ]wide|organisation[- ]wide|company[- ]wide|org[- ]wide|"
+        r"across (?:the )?(?:organization|organisation|company)|every employee|all employees)\b",
+        security_text,
+        re.IGNORECASE,
+    ) and re.search(
+        r"\b(absenteeism|absence|attendance|workforce|leave balance|payroll|compensation)\b",
+        security_text,
+        re.IGNORECASE,
+    ):
+        intent = "unauthorized_access"
         violation = True
     elif unsupported_destructive_request(security_text) and not hr_employee_delete:
         intent = "unsupported_mutation"
@@ -229,23 +279,71 @@ def classify_intent(state: HRState) -> dict:
     elif broad_private_data_request(security_text) and user.role != "hr_admin":
         intent = "unauthorized_access"
         violation = True
+    elif user.role == "manager" and (
+        workforce_corrective_prepare_question(security_text)
+        or workforce_attendance_corrective_question(security_text)
+    ):
+        intent = "unauthorized_access"
+        violation = True
     else:
         violation = False
         intent = ruled
         # Concrete leave-request approve/reject uses the same decide_approval service as REST.
         approval_ask = parse_approval_decision(message)
-        if approval_ask:
+        guidance_ask = user.role in {"manager", "hr_admin"} and manager_leave_decision_guidance_question(message)
+        if user.role == "employee" and employee_self_approval_question(message):
             intent = "approval_decision"
+            mode = "deterministic"
+        elif approval_ask and not guidance_ask:
+            intent = "approval_decision"
+            mode = "deterministic"
+        if user.role == "manager" and re.search(
+            r"\bprepare (?:approval|rejection)\b", message, re.IGNORECASE
+        ) and re.search(r"\b(pending|direct report|leave request)\b", message, re.IGNORECASE):
+            intent = "approval_decision"
+            mode = "deterministic"
+        if (
+            user.role in {"manager", "hr_admin"}
+            and approval_inbox_question(message)
+            and not personal_leave_status_question(message)
+        ):
+            intent = "team_analytics"
+            mode = "deterministic"
+        if user.role in {"manager", "hr_admin"} and managed_leave_request_status_id(message):
+            intent = "team_analytics"
+            mode = "deterministic"
+        if user.role in {"manager", "hr_admin"} and team_leave_overlap_question(message):
+            intent = "team_conflict"
+            mode = "deterministic"
+        if (
+            user.role == "employee"
+            and advance_leave_eligibility_question(message)
+            and not _explicit_leave_request(message)
+            and intent
+            in {
+                "leave_planning",
+                "leave_request",
+                "policy_question",
+                "leave_policy",
+                "general_hr",
+                "out_of_scope",
+            }
+        ):
+            intent = "leave_eligibility"
             mode = "deterministic"
         if leave_date_recommendation_question(message):
             intent = "leave_planning"
             leave_focus = "recommend_dates"
             mode = "deterministic"
-        if delayed_approval_advice_question(message):
+        if delayed_approval_advice_question(message) and not employee_self_approval_question(message):
             intent = "leave_request_status"
             mode = "deterministic"
         # Employees never need manager permissions for their own pending/status leave.
-        if user.role == "employee" and personal_leave_status_question(message):
+        if (
+            user.role == "employee"
+            and personal_leave_status_question(message)
+            and not employee_self_approval_question(message)
+        ):
             intent = "leave_request_status"
             mode = "deterministic"
         # Personal reporting-manager identity is profile data, not an org routing audit.
@@ -269,13 +367,28 @@ def classify_intent(state: HRState) -> dict:
         if user.role == "employee" and record_consistency_question(message):
             intent = "org_transfer"
             mode = "deterministic"
-        # HR corrective-action follow-ups stay on the routing investigation, never team analytics.
+        inherited = state.get("record_context") or {}
+        if user.role == "manager" and (
+            workforce_corrective_prepare_question(message)
+            or workforce_attendance_corrective_question(message)
+        ):
+            intent = "unauthorized_access"
+            violation = True
+        # Attendance-grounded corrective guidance stays on workforce analytics; routing remediation on org_transfer.
         if user.role == "hr_admin" and (
+            workforce_attendance_corrective_question(message)
+            or (
+                inherited.get("subject") in {"org_attendance", "workforce_analytics"}
+                and workforce_corrective_thread_prepare(message)
+            )
+        ):
+            intent = "workforce_analytics"
+            mode = "deterministic"
+        elif user.role == "hr_admin" and (
             hr_corrective_action_question(message) or org_transfer_followup_focus(message) == "remediation"
         ):
             intent = "org_transfer"
             mode = "deterministic"
-        inherited = state.get("record_context") or {}
         same_actor = inherited.get("user_id") in {None, user.id} and inherited.get("employee_id") in {None, employee.id}
         # Keep delayed-approval threads from being remapped into manager team analytics.
         if (
@@ -322,20 +435,58 @@ def classify_intent(state: HRState) -> dict:
         ):
             # Do not let QuerySpec steal a confident policy_question rule into leave_balance
             # or directory. Policy-conflict stays on policy_question when hinted that way.
-            if query_spec.metric == "policy_conflict":
+            if query_spec.metric == "policy_conflict" and approval_inbox_question(message):
+                intent = "team_analytics"
+            elif query_spec.metric == "policy_conflict":
                 intent = "policy_question"
             else:
                 intent = hinted
             mode = "deterministic"
-        elif intent == "policy_question" and query_spec.metric == "policy_conflict":
+        elif intent == "policy_question" and query_spec.metric == "policy_conflict" and not approval_inbox_question(
+            message
+        ):
             mode = "deterministic"
         elif hinted and intent == "hr_metrics" and query_spec.intent_hint == "hr_metrics":
             mode = "deterministic"
         # Leave-plan multi-turn follow-ups keep the planned window even when a weak
         # policy/holiday rule would otherwise steal the turn.
+        history = state.get("conversation_history") or []
+        prior_intent = inherited.get("intent") or memory.get("workflow", {}).get("prior_intent")
+        if user.role in {"manager", "hr_admin"} and manager_leave_decision_guidance_question(message):
+            intent = "team_analytics"
+            mode = "deterministic"
+        if unauthorized_leave_consequence_question(message):
+            intent = "policy_question"
+            mode = "deterministic"
+            leave_focus = None
+        if subject_employee_pronoun_followup(message) and inherited.get("subject_employee_id"):
+            intent = "confidential_lookup"
+            mode = "deterministic"
+            leave_follow = None
         leave_follow = leave_plan_followup(message, inherited) if same_actor else None
+        if unauthorized_leave_consequence_question(message):
+            leave_follow = None
+        if leave_follow and user.role in {"manager", "hr_admin"} and manager_leave_decision_guidance_question(message):
+            leave_follow = None
         if leave_follow and not violation:
             intent, leave_focus = leave_follow
+            mode = "deterministic"
+        elif (
+            not violation
+            and user.role == "employee"
+            and not unauthorized_leave_consequence_question(message)
+            and intent != "leave_request_status"
+            and leave_plan_thread_active(
+                message,
+                inherited,
+                prior_intent=prior_intent,
+                conversation_history=history,
+            )
+            and leave_planning_continuation_message(message)
+            and intent not in {"leave_planning", "leave_request"}
+        ):
+            follow = leave_plan_followup(message, inherited) or ("leave_planning", "plan")
+            intent, leave_focus = follow
             mode = "deterministic"
         # Pending-approval follow-ups keep the inbox thread even when a weak policy/transfer
         # rule matched the surface wording ("what happens if I approve", "why urgent").
@@ -353,7 +504,9 @@ def classify_intent(state: HRState) -> dict:
                 )
             )
         ):
-            if approval_follow == "prepare_approve" or parse_approval_decision(message):
+            if approval_follow == "prepare_approve" or (
+                parse_approval_decision(message) and not manager_leave_decision_guidance_question(message)
+            ):
                 intent = "approval_decision"
             else:
                 intent = "team_analytics"
@@ -374,7 +527,14 @@ def classify_intent(state: HRState) -> dict:
         # a weak rule/LLM would pivot to policy.
         if (
             same_actor
-            and inherited.get("subject") in {"attendance", "team_analytics", "team_roster", "employee_directory", "leave_balance"}
+            and inherited.get("subject") in {
+                "attendance",
+                "team_analytics",
+                "team_roster",
+                "employee_directory",
+                "leave_balance",
+                "policy",
+            }
             and re.search(
                 r"\b(switch(?:\s+that)?|instead|now compare|those two|narrow that|focus that|same month|that month)\b",
                 message,
@@ -388,10 +548,32 @@ def classify_intent(state: HRState) -> dict:
                 "team_roster": "team_analytics",
                 "employee_directory": "employee_directory",
                 "leave_balance": "leave_balance",
+                "policy": "policy_question",
             }.get(str(inherited.get("subject")))
             if continued:
                 intent = continued
                 mode = "deterministic"
+        if (
+            not violation
+            and same_actor
+            and inherited.get("subject") == "policy"
+            and re.search(
+                r"\b(policy|version|effective|expired|contradict|conflict|entitlement|document|covered|applicable)\b",
+                message,
+                re.IGNORECASE,
+            )
+            and intent
+            in {
+                "workforce_analytics",
+                "org_attendance",
+                "general_hr",
+                "out_of_scope",
+                "unauthorized_access",
+                "leave_policy",
+            }
+        ):
+            intent = "policy_question"
+            mode = "deterministic"
         # Managers asking about their own reporting line get team analytics deterministically,
         # so a month/status/department filter never depends on the model or falls to self records.
         if not intent and user.role == "manager" and manager_team_ops_question(message):
@@ -563,8 +745,19 @@ def classify_intent(state: HRState) -> dict:
         # Manager team-scope expansion is unauthorized_access (never soft team_analytics allow).
         if (
             user.role == "manager"
-            and organization_wide_request(message)
-            and intent in {"team_analytics", "team_roster", "attendance_query", "general_hr", "out_of_scope"}
+            and requested_org_wide
+            and intent
+            in {
+                "team_analytics",
+                "team_roster",
+                "attendance_query",
+                "general_hr",
+                "out_of_scope",
+                "workforce_analytics",
+                "org_attendance",
+                "hr_metrics",
+                "employee_directory",
+            }
         ):
             intent = "unauthorized_access"
             mode = "deterministic"
@@ -656,6 +849,8 @@ def classify_intent(state: HRState) -> dict:
                 "awaiting_approval_why_urgent",
                 "awaiting_approval_impact",
                 "awaiting_approval_reject_impact",
+                "awaiting_approval_approve_guidance",
+                "awaiting_approval_reject_guidance",
                 "pending_leave",
                 "",
                 None,
@@ -683,7 +878,9 @@ def classify_intent(state: HRState) -> dict:
                 "approval_decision",
             }
         ):
-            if approval_follow == "prepare_approve" or parse_approval_decision(message):
+            if approval_follow == "prepare_approve" or (
+                parse_approval_decision(message) and not manager_leave_decision_guidance_question(message)
+            ):
                 intent = "approval_decision"
             else:
                 intent = "team_analytics"
@@ -691,7 +888,15 @@ def classify_intent(state: HRState) -> dict:
         # Keep routing-audit investigation threads on org_transfer for urgency/importance/steps follow-ups.
         if (
             same_actor
+            and inherited_ctx.get("subject") == "workforce_analytics"
+            and workforce_corrective_prepare_question(message)
+        ):
+            intent = "workforce_analytics"
+            mode = "deterministic"
+        if (
+            same_actor
             and inherited_ctx.get("subject") in {"routing_audit", "routing_investigation", "org_transfer"}
+            and not workforce_corrective_prepare_question(message)
             and (
                 org_transfer_followup_focus(message) is not None
                 or hr_corrective_action_question(message)
@@ -756,6 +961,8 @@ def classify_intent(state: HRState) -> dict:
             and workforce_followup_question(message)
             and not re.search(r"\b(my team|direct reports?)\b", message, re.IGNORECASE)
             and not comparison_followup
+            and not org_attendance_month_comparison_question(message)
+            and not org_attendance_named_month_rate_question(message)
         ):
             intent = "workforce_analytics"
             mode = "deterministic"
@@ -792,6 +999,40 @@ def classify_intent(state: HRState) -> dict:
         ):
             intent = "workforce_analytics"
             mode = "deterministic"
+        if user.role == "hr_admin" and intent == "workforce_analytics" and (
+            org_attendance_month_comparison_question(message)
+            or org_attendance_named_month_rate_question(message)
+        ):
+            intent = "org_attendance"
+            mode = "deterministic"
+        if (
+            user.role == "hr_admin"
+            and intent in {"policy_question", "general_hr", "out_of_scope", None, ""}
+            and hr_workforce_risk_analytics_question(message)
+        ):
+            intent = "workforce_analytics"
+            mode = "deterministic"
+        if (
+            user.role == "hr_admin"
+            and same_actor
+            and inherited_ctx.get("subject") == "workforce_analytics"
+            and inherited_ctx.get("focus") == "workforce_risk_plan"
+            and re.search(
+                r"\b(why|reason|explain|prioriti[sz]e|that department|those departments|action plan)\b",
+                message,
+                re.IGNORECASE,
+            )
+            and intent
+            in {
+                "policy_question",
+                "general_hr",
+                "out_of_scope",
+                "org_attendance",
+                "hr_metrics",
+            }
+        ):
+            intent = "workforce_analytics"
+            mode = "deterministic"
         # Preserve a prior directory hire-date filter when HR asks about tenure of that cohort.
         if (
             user.role == "hr_admin"
@@ -811,6 +1052,16 @@ def classify_intent(state: HRState) -> dict:
         # Keep concrete approval decisions from being remapped to org HR actions or analytics.
         if approval_ask and not violation:
             intent = "approval_decision"
+            mode = "deterministic"
+        # HR named-person identity asks (e.g. "who is Liam Chen") are directory lookups, not policy.
+        if (
+            not violation
+            and user.role == "hr_admin"
+            and mentioned
+            and not kinds
+            and named_employee_identity_question(message)
+        ):
+            intent = "employee_directory"
             mode = "deterministic"
         # Employee delayed-approval follow-ups must never become manager team analytics.
         if (
@@ -1002,6 +1253,22 @@ def classify_intent(state: HRState) -> dict:
                 mode = "deterministic"
             if (
                 user.role in {"manager", "hr_admin"}
+                and team_leave_overlap_question(message)
+                and intent
+                in {
+                    "leave_planning",
+                    "leave_request",
+                    "policy_question",
+                    "leave_policy",
+                    "team_analytics",
+                    "workforce_analytics",
+                    "general_hr",
+                }
+            ):
+                intent = "team_conflict"
+                mode = "deterministic"
+            if (
+                user.role in {"manager", "hr_admin"}
                 and approval_inbox_question(message)
                 and not personal_leave_status_question(message)
                 and intent
@@ -1012,6 +1279,11 @@ def classify_intent(state: HRState) -> dict:
                     "out_of_scope",
                     "team_roster",
                     "org_leave",
+                    "policy_question",
+                    "leave_policy",
+                    "workforce_analytics",
+                    "attendance_query",
+                    "leave_planning",
                 }
             ):
                 intent = "team_analytics"
@@ -1064,9 +1336,21 @@ def classify_intent(state: HRState) -> dict:
             ):
                 intent = "policy_question"
                 mode = "deterministic"
+        if (
+            not violation
+            and user.role == "employee"
+            and not unauthorized_leave_consequence_question(message)
+            and context.get("subject") == "leave_plan"
+            and intent in {"policy_question", "general_hr", "employee_profile", "leave_eligibility"}
+            and (leave_planning_continuation_message(message) or leave_plan_followup(message, context))
+        ):
+            follow = leave_plan_followup(message, context) or ("leave_planning", "plan")
+            intent, leave_focus = follow
+            mode = "deterministic"
     result = {
         "role": user.role,
         "intent": intent,
+        "requested_org_wide": requested_org_wide,
         "orchestration_mode": mode,
         "injection_flag": bool(injections),
         "business_days": days if days else (0 if clarify else 10),
@@ -1105,7 +1389,13 @@ def classify_intent(state: HRState) -> dict:
         "compensation_query",
         "hr_metrics",
         "workforce_analytics",
+        "employee_directory",
+        "confidential_lookup",
+        "employee_profile",
     } or (
+        context.get("subject_employee_id") is not None
+        and intent in {"confidential_lookup", "employee_directory", "employee_profile", "policy_question"}
+    ) or (
         intent == "leave_balance" and re.search(r"\b(that|those|affect|impact)\b", text)
     ) or (
         intent in _REQUEST_INTENTS and re.search(r"\b(prepare|the request|it)\b", text)
@@ -1124,8 +1414,35 @@ def classify_intent(state: HRState) -> dict:
             )
         )
     )
-    if not continuing:
+    if intent == "leave_request_status" and context.get("subject") == "leave_plan":
         result["record_context"] = None
+    elif not continuing and context.get("subject") == "leave_plan":
+        result["record_context"] = context
+    elif (
+        not continuing
+        and intent != "leave_request_status"
+        and leave_plan_thread_active(
+            message,
+            context,
+            prior_intent=state.get("memory", {}).get("workflow", {}).get("prior_intent"),
+            conversation_history=state.get("conversation_history") or [],
+        )
+    ):
+        result["record_context"] = context or None
+    elif not continuing:
+        result["record_context"] = None
+    elif context:
+        result["record_context"] = context
+    if unauthorized_leave_consequence_question(message):
+        result["intent"] = "policy_question"
+        result["leave_focus"] = None
+        result["record_context"] = {
+            "subject": "policy",
+            "intent": "policy_question",
+            "policy_topic": "unauthorized_leave",
+            "user_id": user.id,
+            "employee_id": employee.id,
+        }
     return result
 
 
@@ -1137,8 +1454,13 @@ def authorize(state: HRState) -> dict:
     kinds = set(state.get("sensitive_kinds") or [])
     reason = ""
     allowed = True
+    auth_extras: dict = {}
     message = state.get("message", "")
-    if state.get("clarify"):
+    requested_org_wide = user.role == "manager" and (
+        state.get("requested_org_wide")
+        or manager_requested_organization_scope(state.get("raw_message") or "", message)
+    )
+    if state.get("clarify") and not requested_org_wide:
         return {
             "authorized": True,
             "workflow": [_step("authorize", "Security and authorization", "complete", "clarification required before data access")],
@@ -1153,6 +1475,10 @@ def authorize(state: HRState) -> dict:
         allowed = False
         reason = security.reason
         intent = security.intent
+    elif requested_org_wide:
+        allowed = False
+        intent = "unauthorized_access"
+        reason = "Organization-wide workforce analytics require HR Admin access. Managers may access analytics for their direct reports."
     elif intent == "unsupported_mutation":
         allowed = False
         reason = (
@@ -1221,51 +1547,58 @@ def authorize(state: HRState) -> dict:
                     allowed = False
                     reason = str(exc)
                     break
+    elif user.role == "employee" and (
+        employee_self_approval_question(message)
+        or (intent == "leave_request_status" and parse_approval_decision(message))
+    ):
+        allowed = False
+        intent = "unauthorized_access"
+        reason = (
+            "Employees cannot approve or reject leave requests, including their own. "
+            "Only your assigned manager or HR can approve or reject pending leave. "
+            "You may ask about the status of your requests, but you cannot act as the approver."
+        )
     elif intent == "approval_decision":
         # Primary security control: deny before tool selection / pending preparation.
-        from app.access import can_decide_approval
-        from app.models import Approval, LeaveRequest
+        from app.access import approval_decision_access
+        from app.services.approval_resolution import nl_approval_resolution
 
-        if user.role == "employee":
-            allowed = False
-            intent = "unauthorized_access"
-            reason = (
-                "Employees cannot approve or reject leave requests, including their own. "
-                "Approval decisions are limited to the assigned manager or an HR administrator."
-            )
-        elif user.role not in {"manager", "hr_admin"}:
-            allowed = False
-            intent = "unauthorized_access"
-            reason = "Only managers and HR administrators can approve or reject leave requests."
-        else:
-            approval_ask = parse_approval_decision(message) or {}
-            request_id = approval_ask.get("request_id")
-            approval_id = approval_ask.get("approval_id")
-            approval = None
-            if approval_id is not None:
-                approval = ctx.db.get(Approval, int(approval_id))
-            elif request_id is not None:
-                leave = ctx.db.get(LeaveRequest, int(request_id))
-                if leave is not None:
-                    approval = (
-                        ctx.db.query(Approval)
-                        .filter(
-                            Approval.leave_request_id == leave.id,
-                            Approval.status == "pending",
-                        )
-                        .order_by(Approval.stage.asc(), Approval.id.asc())
-                        .first()
-                    )
-                if approval is None:
-                    approval = ctx.db.get(Approval, int(request_id))
-            if approval is not None and not can_decide_approval(user, approval):
+        resolution, approval_ask = nl_approval_resolution(ctx.db, user, employee, message, targets)
+        request_id = approval_ask.get("request_id")
+        approval_id = approval_ask.get("approval_id")
+        if resolution:
+            if resolution["status"] == "resolved":
+                request_id = resolution.get("request_id")
+                auth_extras["resolved_request_id"] = request_id
+            elif resolution["status"] == "clarify":
+                auth_extras["approval_resolution"] = resolution
+            elif resolution["status"] in {"not_found", "unauthorized"}:
                 allowed = False
                 intent = "unauthorized_access"
-                reason = (
-                    "You are not authorized to approve or reject this leave request. "
-                    "Managers may only decide requests assigned to them within their reporting scope, "
-                    "and nobody may decide their own leave."
-                )
+                reason = resolution["message"]
+        if allowed and resolution and resolution.get("status") == "clarify":
+            pass
+        elif allowed and request_id is not None:
+            ok, gate_reason = approval_decision_access(
+                ctx.db,
+                user,
+                request_id=int(request_id),
+                approval_id=int(approval_id) if approval_id is not None else None,
+            )
+            if not ok:
+                allowed = False
+                intent = "unauthorized_access"
+                reason = gate_reason
+        elif allowed and approval_ask and approval_ask.get("request_id") is not None:
+            ok, gate_reason = approval_decision_access(
+                ctx.db,
+                user,
+                request_id=int(approval_ask["request_id"]),
+            )
+            if not ok:
+                allowed = False
+                intent = "unauthorized_access"
+                reason = gate_reason
     elif intent == "team_conflict" and user.role not in {"manager", "hr_admin"}:
         allowed = False
         reason = "Team staffing analysis is limited to managers and HR administrators."
@@ -1337,9 +1670,7 @@ def authorize(state: HRState) -> dict:
             "Your own attendance remains available through personal attendance questions."
         )
         intent = "unauthorized_access"
-    elif intent == "workforce_analytics" and user.role == "manager" and organization_wide_request(
-        state.get("message") or ""
-    ):
+    elif intent == "workforce_analytics" and user.role == "manager" and requested_org_wide:
         # Explicit org-wide wording is denied; managers never receive organization attendance extracts.
         allowed = False
         reason = (
@@ -1405,12 +1736,14 @@ def authorize(state: HRState) -> dict:
             "analytics": {},
             "workflow": [_step("authorize", "Security and authorization", "denied", denied_detail[:300])],
             "tool_trace": [_tool("authorize", "denied", reason[:300])],
+            **auth_extras,
         }
     return {
         "authorized": True,
         "denial_reason": "",
         "workflow": [_step("authorize", "Security and authorization", "complete", intent or "")],
         "tool_trace": [_tool("authorize", "allowed", intent or "")],
+        **auth_extras,
     }
 
 
@@ -1454,14 +1787,89 @@ def employee_context(state: HRState) -> dict:
 def approval_decision(state: HRState) -> dict:
     """Prepare approve/reject for human confirmation; execution uses the same decide_approval service as REST."""
     from app.services.actions import _can_decide
+    from app.services.approval_resolution import nl_approval_resolution
 
     ctx = get_ctx()
-    user, _employee, _department = load_actor(ctx.db, ctx.user_id)
+    user, employee, _department = load_actor(ctx.db, ctx.user_id)
     message = state.get("message") or ""
     parsed = parse_approval_decision(message) or {}
     decision = parsed.get("decision")
-    request_id = parsed.get("request_id")
+    request_id = state.get("resolved_request_id") or parsed.get("request_id")
     reason = parsed.get("reason") or ""
+    pending_resolution = state.get("approval_resolution")
+    if pending_resolution and pending_resolution.get("status") == "clarify" and request_id is None:
+        analysis = {
+            "kind": "approval_decision",
+            "status": "needs_clarification",
+            "message": pending_resolution.get("message") or "",
+            "candidates": pending_resolution.get("candidates") or [],
+            "confirmation_required": False,
+        }
+        return {
+            "analysis": analysis,
+            "pending_action": None,
+            "record_context": {
+                "subject": "approval_decision",
+                "decision": decision,
+                "user_id": user.id,
+                "employee_id": user.employee_id,
+                "subject_employee_id": pending_resolution.get("subject_employee_id"),
+            },
+            "workflow": [_step("approval_decision", "Approval decision", "complete", "clarify")],
+            "tool_trace": [_tool("prepare_approval_decision", "clarify", "multiple pending requests")],
+        }
+    prepare_flow = approval_inbox_followup_focus(message) in {"prepare_approve", "prepare_reject"}
+    resolution = None
+    if request_id is None:
+        resolution, _parsed = nl_approval_resolution(
+            ctx.db,
+            user,
+            employee,
+            message,
+            list(state.get("target_employee_ids") or []),
+        )
+        if resolution and resolution.get("status") == "clarify" and not prepare_flow:
+            analysis = {
+                "kind": "approval_decision",
+                "status": "needs_clarification",
+                "message": resolution.get("message") or "",
+                "candidates": resolution.get("candidates") or [],
+                "confirmation_required": False,
+            }
+            return {
+                "analysis": analysis,
+                "pending_action": None,
+                "record_context": {
+                    "subject": "approval_decision",
+                    "decision": decision,
+                    "user_id": user.id,
+                    "employee_id": user.employee_id,
+                    "subject_employee_id": resolution.get("subject_employee_id"),
+                },
+                "workflow": [_step("approval_decision", "Approval decision", "complete", "clarify")],
+                "tool_trace": [_tool("prepare_approval_decision", "clarify", "multiple pending requests")],
+            }
+        if resolution and resolution.get("status") == "resolved":
+            request_id = resolution.get("request_id")
+        if resolution and resolution.get("status") == "not_found" and prepare_flow:
+            analysis = {
+                "kind": "approval_decision",
+                "status": "not_found",
+                "message": resolution.get("message") or "",
+                "confirmation_required": False,
+            }
+            return {
+                "analysis": analysis,
+                "pending_action": None,
+                "record_context": {
+                    "subject": "approval_decision",
+                    "decision": decision,
+                    "user_id": user.id,
+                    "employee_id": user.employee_id,
+                },
+                "workflow": [_step("approval_decision", "Approval decision", "complete", "not found")],
+                "tool_trace": [_tool("prepare_approval_decision", "clarify", "no direct report pending")],
+            }
     inherited = state.get("record_context") or {}
     if request_id is None:
         for key in ("selected_request_id", "request_id"):
@@ -1474,30 +1882,47 @@ def approval_decision(state: HRState) -> dict:
                 break
     if decision is None and inherited.get("subject") == "approval_decision" and inherited.get("decision"):
         decision = inherited["decision"]
-    if decision is None and approval_inbox_followup_focus(message) == "prepare_approve":
+    approval_follow = approval_inbox_followup_focus(message)
+    if decision is None and approval_follow == "prepare_approve":
         decision = "approve"
+    if decision is None and approval_follow == "prepare_reject":
+        decision = "reject"
+    if request_id is None and (approval_follow in {"prepare_approve", "prepare_reject"} or prepare_flow):
+        from app.services.approval_resolution import (
+            first_decidable_direct_report_leave_request,
+            first_decidable_leave_request,
+        )
+
+        auto_id = first_decidable_direct_report_leave_request(ctx.db, user, employee)
+        if auto_id is None:
+            auto_id = first_decidable_leave_request(ctx.db, user, employee)
+        if auto_id is not None:
+            request_id = auto_id
     if decision == "reject" and not reason:
-        analysis = {
-            "kind": "approval_decision",
-            "status": "needs_reason",
-            "decision": decision,
-            "request_id": request_id,
-            "message": "A rejection reason is required. Example: reject request 12 because coverage is insufficient.",
-            "confirmation_required": True,
-        }
-        return {
-            "analysis": analysis,
-            "pending_action": None,
-            "record_context": {
-                "subject": "approval_decision",
+        if approval_follow == "prepare_reject":
+            reason = "Operational coverage concern (manager draft)."
+        else:
+            analysis = {
+                "kind": "approval_decision",
+                "status": "needs_reason",
                 "decision": decision,
                 "request_id": request_id,
-                "user_id": user.id,
-                "employee_id": user.employee_id,
-            },
-            "workflow": [_step("approval_decision", "Approval decision", "complete", "reason required")],
-            "tool_trace": [_tool("prepare_approval_decision", "clarify", "rejection reason required")],
-        }
+                "message": "A rejection reason is required. Example: reject request 12 because coverage is insufficient.",
+                "confirmation_required": True,
+            }
+            return {
+                "analysis": analysis,
+                "pending_action": None,
+                "record_context": {
+                    "subject": "approval_decision",
+                    "decision": decision,
+                    "request_id": request_id,
+                    "user_id": user.id,
+                    "employee_id": user.employee_id,
+                },
+                "workflow": [_step("approval_decision", "Approval decision", "complete", "reason required")],
+                "tool_trace": [_tool("prepare_approval_decision", "clarify", "rejection reason required")],
+            }
     if decision is None or request_id is None:
         analysis = {
             "kind": "approval_decision",
@@ -1511,20 +1936,26 @@ def approval_decision(state: HRState) -> dict:
             "workflow": [_step("approval_decision", "Approval decision", "complete", "clarification")],
             "tool_trace": [_tool("prepare_approval_decision", "clarify", "missing request id or decision")],
         }
-    leave = ctx.db.get(LeaveRequest, int(request_id))
-    approval = None
-    if leave is not None:
-        approval = (
-            ctx.db.query(Approval)
-            .filter(
-                Approval.leave_request_id == leave.id,
-                Approval.status == "pending",
-            )
-            .order_by(Approval.stage.asc(), Approval.id.asc())
-            .first()
-        )
-    if approval is None:
-        approval = ctx.db.get(Approval, int(request_id))
+    from app.access import approval_decision_access, resolve_leave_approval_reference
+
+    ok, gate_reason = approval_decision_access(ctx.db, user, request_id=int(request_id))
+    if not ok:
+        analysis = {
+            "kind": "approval_decision",
+            "status": "denied",
+            "request_id": request_id,
+            "decision": decision,
+            "message": gate_reason,
+            "confirmation_required": False,
+        }
+        return {
+            "analysis": analysis,
+            "pending_action": None,
+            "workflow": [_step("approval_decision", "Approval decision", "denied", gate_reason[:180])],
+            "tool_trace": [_tool("prepare_approval_decision", "denied", gate_reason[:120])],
+        }
+    approval = resolve_leave_approval_reference(ctx.db, request_id=int(request_id))
+    leave = ctx.db.get(LeaveRequest, int(request_id)) if request_id is not None else None
     if approval is None:
         analysis = {
             "kind": "approval_decision",
@@ -1580,17 +2011,36 @@ def approval_decision(state: HRState) -> dict:
             "tool_trace": [_tool("prepare_approval_decision", "denied", "not assigned approver")],
         }
 
-    pending = prepare_decision_pending(
-        ctx.db,
-        user,
-        conversation_id=getattr(ctx, "conversation_id", None),
-        approval_id=approval.id,
-        request_id=leave.id if leave is not None else request_id,
-        decision=decision,
-        reason=reason,
-        thread_id=getattr(ctx, "thread_id", None),
-        ip=getattr(ctx, "ip", None),
-    )
+    from app.services.confirmation import ConfirmationError
+
+    try:
+        pending = prepare_decision_pending(
+            ctx.db,
+            user,
+            conversation_id=getattr(ctx, "conversation_id", None),
+            approval_id=approval.id,
+            request_id=leave.id if leave is not None else request_id,
+            decision=decision,
+            reason=reason,
+            thread_id=getattr(ctx, "thread_id", None),
+            ip=getattr(ctx, "ip", None),
+        )
+    except ConfirmationError as exc:
+        analysis = {
+            "kind": "approval_decision",
+            "status": "denied",
+            "request_id": request_id,
+            "approval_id": approval.id,
+            "decision": decision,
+            "message": exc.message,
+            "confirmation_required": False,
+        }
+        return {
+            "analysis": analysis,
+            "pending_action": None,
+            "workflow": [_step("approval_decision", "Approval decision", "denied", exc.message[:180])],
+            "tool_trace": [_tool("prepare_approval_decision", "denied", exc.message[:120])],
+        }
     if pending.get("already_executed"):
         prior = pending.get("prior_result") or {}
         analysis = {
@@ -1645,8 +2095,35 @@ def approval_decision(state: HRState) -> dict:
 def leave_analysis(state: HRState) -> dict:
     ctx = get_ctx()
     user, employee, _department = load_actor(ctx.db, ctx.user_id)
+    message = state.get("message") or ""
     if state.get("intent") == "team_conflict":
-        analysis = analyze_team(ctx.db, employee)
+        from app.services.leave_engine import resolve_team_overlap_window
+
+        window_start, window_end, window_label, window_err = resolve_team_overlap_window(message)
+        if window_err:
+            analysis = {
+                "kind": "team_conflict",
+                "status": window_err.get("status", "needs_clarification"),
+                "message": window_err.get("message", "Specify one calendar month to review."),
+            }
+            return {
+                "analysis": analysis,
+                "record_context": {
+                    "subject": "team_conflict",
+                    "user_id": user.id,
+                    "employee_id": employee.id,
+                    "focus": "overlap",
+                },
+                "workflow": [_step("leave_analysis", "Leave and attendance analysis", "clarify", window_err.get("message", ""))],
+                "tool_trace": [_tool("analyze_team_conflicts", "clarify", "overlap window")],
+            }
+        analysis = analyze_team(
+            ctx.db,
+            employee,
+            filter_start=window_start,
+            filter_end=window_end,
+            filter_label=window_label or None,
+        )
         pair_count = len(analysis.get("overlap_pairs") or [])
         request_count = len(analysis.get("requests") or [])
         if pair_count:
@@ -1666,7 +2143,6 @@ def leave_analysis(state: HRState) -> dict:
             "tool_trace": [_tool(tool, "ok", summary)],
         }
 
-    message = state.get("message") or ""
     parsed = parse_leave_dates(message)
     context = state.get("record_context") or {}
     focus = state.get("leave_focus") or ""
@@ -1800,6 +2276,24 @@ def leave_analysis(state: HRState) -> dict:
 def workforce_analytics(state: HRState) -> dict:
     ctx = get_ctx()
     user, employee, _department = load_actor(ctx.db, ctx.user_id)
+    raw = state.get("raw_message") or state.get("message") or ""
+    if user.role == "manager" and (
+        state.get("requested_org_wide")
+        or manager_requested_organization_scope(raw, state.get("message") or "")
+    ):
+        reason = (
+            "Organization-level aggregate analytics are limited to HR administrators. "
+            "Managers may review attendance patterns for their authorized direct reports only."
+        )
+        return {
+            "intent": "unauthorized_access",
+            "authorized": False,
+            "denial_reason": reason,
+            "analysis": None,
+            "analytics": {},
+            "workflow": [_step("workforce_analytics", "Workforce analytics", "denied", "organization-wide scope blocked")],
+            "tool_trace": [],
+        }
     message = (state.get("message") or "").lower()
     months = 3
     inherited = _usable_context(state, user.id, employee.id) or {}
@@ -1862,6 +2356,7 @@ def workforce_analytics(state: HRState) -> dict:
             "investigation": payload.get("investigation"),
             "priority_employees": payload.get("priority_employees") or [],
             "recommendations": payload.get("recommendations"),
+            "workforce_risk_findings": payload.get("workforce_risk_findings"),
             "limitations": payload.get("limitations"),
         },
         "record_context": {
@@ -2238,6 +2733,8 @@ def _focus_citations(db, citations: list[dict], keywords: tuple[str, ...]) -> li
 def _policy_topic(message: str, inherited: dict | None) -> str:
     text = message.lower()
     inherited = inherited or {}
+    if unauthorized_leave_consequence_question(text):
+        return "unauthorized_leave"
     if post_approval_question(text):
         return "post_approval"
     if re.search(r"\breset\b", text):
@@ -2273,6 +2770,10 @@ def _retrieval_query(state: HRState) -> str:
         return message + " annual leave notice period duration business days approval"
     if intent == "team_conflict":
         return "leave approval policy manager decision People Operations co-approval"
+    if intent == "team_analytics":
+        focus = ((state.get("analysis") or {}).get("focus") or "").lower()
+        if focus in {"awaiting_approval_approve_guidance", "awaiting_approval_reject_guidance"}:
+            return "leave approval policy manager coverage balance co-approval rejection consequences"
     if intent == "workforce_analytics":
         return "attendance policy unplanned absence core hours"
     if intent == "org_transfer":
@@ -2301,8 +2802,13 @@ def _retrieval_query(state: HRState) -> str:
             return message + " sick leave is not part of the annual leave balance"
         if "transfer" in text:
             return "employee transfer policy approval"
-        if re.search(r"absent without|without prior approval|unplanned absence", text):
-            return "attendance policy weekday unplanned absence prior approval"
+        if unauthorized_leave_consequence_question(message) or re.search(
+            r"absent without|without prior approval|unplanned absence", text
+        ):
+            return (
+                "attendance policy unplanned absence notify manager leave approved in advance "
+                "leave approval confirmed HRIS pending not approved"
+            )
         if "insufficient" in text and "balance" in text:
             return "annual leave insufficient balance a request is not accepted when the employee does not have sufficient annual leave balance"
         if "consecutive" in text and "leave" in text:
@@ -2420,6 +2926,9 @@ def retrieve_policy(state: HRState) -> dict:
         "evidence",
         "absence",
         "department_breakdown",
+        "workforce_risk_plan",
+        "corrective_prepare",
+        "proposed_action",
     }:
         empty = {
             "citations": [],
@@ -2434,13 +2943,27 @@ def retrieve_policy(state: HRState) -> dict:
             "workflow": [_step("retrieve_policy", "HR policy retrieval", "complete", "skipped")],
             "tool_trace": [_tool("search_policies", "skipped", "analytics focus — no policy retrieval")],
         }
-    result = retrieve(
-        ctx.db,
-        _retrieval_query(state),
-        role=user.role,
-        department=department.name if department else None,
-        location=employee.location,
-    )
+    unauthorized_leave = unauthorized_leave_consequence_question(state.get("message") or "")
+    if unauthorized_leave:
+        result = retrieve(
+            ctx.db,
+            "attendance policy unplanned absence weekday notify manager approved in advance not confirmed HRIS",
+            role=user.role,
+            department=department.name if department else None,
+            location=employee.location,
+        )
+        result = dict(result)
+        result["conflicts"] = []
+        if result.get("confidence") == "conflict":
+            result["confidence"] = "adequate"
+    else:
+        result = retrieve(
+            ctx.db,
+            _retrieval_query(state),
+            role=user.role,
+            department=department.name if department else None,
+            location=employee.location,
+        )
     note = ""
     if state.get("intent") in _REQUEST_INTENTS and "extended-leave-approval" in conflict_groups_in_force(ctx.db):
         note = (
@@ -2463,7 +2986,9 @@ def retrieve_policy(state: HRState) -> dict:
             citations = _focus_citations(ctx.db, citations, ("carry", "unused", "5", "march"))
         elif "consecutive" in lowered and "leave" in lowered:
             citations = _focus_citations(ctx.db, citations, ("consecutive",))
-        elif re.search(r"absent without|without prior approval", lowered):
+        elif re.search(r"absent without|without prior approval", lowered) or unauthorized_leave_consequence_question(
+            message
+        ):
             citations = _focus_citations(ctx.db, citations, ("unplanned", "notifies"))
         elif _policy_topic(message, state.get("record_context")) == "leave_reset":
             citations = _focus_citations(ctx.db, citations, ("calendar year", "carry", "unused", "march"))
@@ -2505,6 +3030,8 @@ def retrieve_policy(state: HRState) -> dict:
             }
         elif topic == "post_approval":
             stored["analysis"] = post_approval_facts()
+        elif topic == "unauthorized_leave":
+            stored["analysis"] = {"kind": "unauthorized_leave_consequence"}
         elif topic == "leave_reset":
             stored["analysis"] = {"kind": "leave_reset"}
         elif topic == "leave_carryover":
@@ -2529,6 +3056,11 @@ def retrieve_policy(state: HRState) -> dict:
 
 def assess_eligibility(state: HRState) -> dict:
     """Compare the signed-in balance with the annual leave policy. Do not open a request."""
+    from app.clock import add_business_days, notice_business_days, org_today
+    from app.services.holidays import holidays_for_employee
+    from app.services.leave_engine import assess_window, notice_required
+    from app.services.records import parse_relative_leave_start
+
     ctx = get_ctx()
     _user, employee, department = load_actor(ctx.db, ctx.user_id)
     message = state.get("message") or ""
@@ -2545,6 +3077,33 @@ def assess_eligibility(state: HRState) -> dict:
     result = dict(result)
     result["citations"] = citations
     requested = requested_leave_days(message)
+    proposed_start = parse_relative_leave_start(message)
+    proposed_window: dict | None = None
+    if proposed_start is not None:
+        today = org_today()
+        horizon_end = proposed_start + timedelta(days=120)
+        closed = holidays_for_employee(ctx.db, employee, today, horizon_end).dates
+        notice = notice_business_days(today, proposed_start, closed)
+        if requested:
+            leave_end = add_business_days(proposed_start, int(requested), closed)
+            proposed_window = assess_window(
+                ctx.db, employee, proposed_start, leave_end, leave_type="annual"
+            )
+            proposed_window = {
+                **proposed_window,
+                "proposed_start": proposed_start.isoformat(),
+                "proposed_end": leave_end.isoformat(),
+                "requested_days": requested,
+            }
+        else:
+            required = notice_required(5)
+            proposed_window = {
+                "proposed_start": proposed_start.isoformat(),
+                "notice_business_days": notice,
+                "notice_required_example": required,
+                "notice_ok_for_example": notice >= required,
+                "duration_specified": False,
+            }
     return {
         "analysis": {
             "kind": "leave_eligibility",
@@ -2552,12 +3111,14 @@ def assess_eligibility(state: HRState) -> dict:
             "balance": annual,
             "requested_days": requested,
             "hypothetical_remaining": hypothetical_remaining_days(message),
+            "proposed_window": proposed_window,
         },
         "record_context": {
             "subject": "leave_eligibility",
             "user_id": _user.id,
             "employee_id": employee.id,
             "requested_days": requested,
+            "start": (proposed_window or {}).get("proposed_start") or (proposed_window or {}).get("start"),
         },
         "retrieval": result,
         "citations": citations,
@@ -2576,6 +3137,7 @@ def prepare_workflow(state: HRState) -> dict:
     focus = state.get("leave_focus") or analysis.get("focus") or ""
     ctx = get_ctx()
     user, employee, _department = load_actor(ctx.db, ctx.user_id)
+    analytics_payload = state.get("analytics")
     # Review / recommendations / coverage checks never authorize submission alone.
     defer_pending = focus in {
         "draft_review",
@@ -2674,15 +3236,66 @@ def prepare_workflow(state: HRState) -> dict:
             detail = "awaiting HR filing confirmation"
         else:
             detail = "read-only routing investigation; no pending action"
+    elif intent == "workforce_analytics" and workforce_corrective_prepare_question(state.get("message") or ""):
+        analytics_payload = state.get("analytics") or {}
+        if not analytics_payload.get("departments"):
+            months = int((state.get("record_context") or {}).get("months") or 3)
+            analytics_payload = absence_analytics(ctx.db, user, months=months)
+        proposal = workforce_corrective_proposal(analytics_payload)
+        if proposal and user.role == "hr_admin":
+            pending = prepare_workforce_corrective_pending(
+                ctx.db,
+                user,
+                conversation_id=getattr(ctx, "conversation_id", None),
+                proposal=proposal,
+                thread_id=getattr(ctx, "thread_id", None),
+                ip=getattr(ctx, "ip", None),
+            )
+            detail = "awaiting HR corrective confirmation"
+            analysis = {
+                **(state.get("analysis") or {}),
+                "kind": "workforce_analytics",
+                "focus": "corrective_prepare",
+                "proposal": proposal,
+            }
+        else:
+            detail = "corrective prepare blocked or no analytics"
     elif intent == "approval_decision" and (state.get("pending_action") or {}).get("pending_action_id"):
         pending = state.get("pending_action")
         detail = f"approval pending:{pending.get('pending_action_id')}"
-    return {
-        "analysis": state.get("analysis") or (analysis if intent == "org_transfer" else state.get("analysis")),
+    if intent == "org_transfer" or (
+        intent == "workforce_analytics"
+        and workforce_corrective_prepare_question(state.get("message") or "")
+    ):
+        patch_analysis = analysis
+    else:
+        patch_analysis = state.get("analysis") or analysis
+
+    record_context = dict(state.get("record_context") or {})
+    if intent == "workforce_analytics" and pending:
+        proposal = (patch_analysis or {}).get("proposal") or (pending or {}).get("proposal") or {}
+        record_context = {
+            **record_context,
+            "subject": "workforce_analytics",
+            "focus": "corrective_prepare",
+            "user_id": user.id,
+            "employee_id": employee.id,
+            "months": proposal.get("months") or record_context.get("months") or 3,
+        }
+    patch: dict = {
+        "analysis": patch_analysis,
         "pending_action": pending,
+        "record_context": record_context,
         "workflow": [_step("prepare_workflow", "Workflow preparation", "complete", detail)],
         "tool_trace": [_tool("prepare_action", "ok" if pending else "skipped", detail)],
     }
+    if (
+        intent == "workforce_analytics"
+        and workforce_corrective_prepare_question(state.get("message") or "")
+        and analytics_payload
+    ):
+        patch["analytics"] = analytics_payload
+    return patch
 
 
 def compose_response(state: HRState) -> dict:
@@ -2733,10 +3346,12 @@ def compose_response(state: HRState) -> dict:
         "awaiting_approval_why_urgent",
         "awaiting_approval_impact",
         "awaiting_approval_reject_impact",
+        "awaiting_approval_approve_guidance",
+        "awaiting_approval_reject_guidance",
         "approval_inbox",
         "recommend_dates",
         "delayed_approval",
-    } or (enriched.get("analysis") or {}).get("filter") == "delayed_approval" or (
+    } or analysis_kind == "unauthorized_leave_consequence" or (enriched.get("analysis") or {}).get("filter") == "delayed_approval" or (
         enriched.get("leave_focus") == "recommend_dates"
     ) or (enriched.get("pending_action") or {}).get("pending_action_id") or (
         # Keep org absence counts from tools deterministic so the LLM cannot drop months.
@@ -2807,11 +3422,16 @@ def human_gate(state: HRState) -> dict:
 
 def execute_workflow(state: HRState) -> dict:
     ctx = get_ctx()
-    user, _employee, _department = load_actor(ctx.db, ctx.user_id)
+    user, employee, _department = load_actor(ctx.db, ctx.user_id)
     pending = state.get("pending_action") or {}
     pending_id = pending.get("pending_action_id")
     row = get_pending(ctx.db, pending_id)
-    if row is None and pending.get("type") in {"submit_leave", "decide_approval", "file_routing_correction"}:
+    if row is None and pending.get("type") in {
+        "submit_leave",
+        "decide_approval",
+        "file_routing_correction",
+        "record_hr_corrective_recommendation",
+    }:
         # Legacy in-memory pending without durable id — refuse rather than write blindly.
         result = {
             "status": "error",
@@ -2834,7 +3454,7 @@ def execute_workflow(state: HRState) -> dict:
         tool_status = "error" if status in {"error", "failed"} else status
     else:
         tool_status = "ok"
-    return {
+    patch: dict = {
         "execution_result": result,
         "pending_action": None,
         "analysis": {
@@ -2846,6 +3466,17 @@ def execute_workflow(state: HRState) -> dict:
         "workflow": [_step("execute_workflow", "Workflow execution", status, (result.get("summary") or "")[:120])],
         "tool_trace": [_tool("execute_authorized_action", tool_status, (result.get("summary") or result.get("message") or "")[:180])],
     }
+    if status in {"submitted", "pending_manager", "pending_hr", "approved", "rejected"}:
+        request_id = result.get("leave_request_id") or (result.get("result") or {}).get("leave_request_id")
+        if request_id:
+            patch["record_context"] = leave_history_record_context(
+                user_id=user.id,
+                employee_id=employee.id,
+                request_id=int(request_id),
+                report_filter="latest",
+            )
+            patch["intent"] = "leave_request_status"
+    return patch
 
 
 def cancel_workflow(state: HRState) -> dict:
@@ -2965,6 +3596,8 @@ def tool_orchestrate(state: HRState) -> dict:
 def route_after_auth(state: HRState) -> str:
     if not state.get("authorized", False) or state.get("clarify"):
         return "compose_response"
+    if state.get("role") == "manager" and state.get("requested_org_wide"):
+        return "compose_response"
     intent = state.get("intent", "")
     message = state.get("message") or ""
     # Focused org-wide absence analytics (highest department, consequences, investigation)
@@ -2980,7 +3613,13 @@ def route_after_auth(state: HRState) -> str:
     )
     if intent == "workforce_analytics" and not comparison_followup:
         return "workforce_analytics"
-    if intent == "org_attendance" and workforce_followup_question(message) and not comparison_followup:
+    if (
+        intent == "org_attendance"
+        and workforce_followup_question(message)
+        and not comparison_followup
+        and not org_attendance_month_comparison_question(message)
+        and not org_attendance_named_month_rate_question(message)
+    ):
         return "workforce_analytics"
     if intent == "workforce_analytics" and comparison_followup:
         # Re-anchor comparison asks onto the org_attendance tool path.
@@ -2989,13 +3628,25 @@ def route_after_auth(state: HRState) -> str:
     # investigate_employee_discrepancy tool is org-wide and denied for employees.
     if intent == "org_transfer" and state.get("role") == "employee":
         return "employee_context"
+    if intent == "approval_decision":
+        return "approval_decision"
+    if intent == "leave_eligibility":
+        return "assess_eligibility"
     # Approval inbox listing / urgency follow-ups are classified as team_analytics; still run tools.
     if intent in _TOOL_ORCHESTRATED_INTENTS or (
         intent == "team_analytics"
         and (
             approval_inbox_question(message)
+            or manager_leave_decision_guidance_question(message)
             or approval_inbox_followup_focus(message)
-            in {"urgency", "why_urgent", "approve_impact", "reject_impact"}
+            in {
+                "urgency",
+                "why_urgent",
+                "approve_impact",
+                "reject_impact",
+                "approve_guidance",
+                "reject_guidance",
+            }
         )
     ):
         return "tool_orchestrate"
@@ -3024,7 +3675,11 @@ def route_after_auth(state: HRState) -> str:
 def route_after_tools(state: HRState) -> str:
     intent = state.get("intent") or ""
     analysis = state.get("analysis") or {}
-    if intent in {"leave_planning", "leave_request"} or analysis.get("kind") == "leave_plan":
+    focus = state.get("leave_focus") or analysis.get("focus") or ""
+    if intent == "leave_request" or (
+        (intent == "leave_planning" or analysis.get("kind") == "leave_plan")
+        and focus in {"prepare", "draft_review", "confirmation_gate"}
+    ):
         return "prepare_workflow"
     # Routing corrections require an explicit file/apply/correct request — never auto-HITL on investigate.
     if (
@@ -3032,6 +3687,8 @@ def route_after_tools(state: HRState) -> str:
         and analysis.get("correction")
         and explicit_routing_correction_request(state.get("message") or "")
     ):
+        return "prepare_workflow"
+    if intent == "workforce_analytics" and workforce_corrective_prepare_question(state.get("message") or ""):
         return "prepare_workflow"
     return "compose_response"
 
@@ -3109,9 +3766,19 @@ def route_after_retrieval(state: HRState) -> str:
     # Date recommendations are guidance only — skip the submission confirmation gate.
     if focus == "recommend_dates" or leave_date_recommendation_question(state.get("message") or ""):
         return "compose_response"
-    if state.get("intent") in {"leave_planning", "leave_request"}:
+    if state.get("intent") == "leave_request":
+        return "prepare_workflow"
+    if state.get("intent") == "leave_planning" and focus in {
+        "prepare",
+        "draft_review",
+        "confirmation_gate",
+    }:
         return "prepare_workflow"
     if state.get("intent") == "org_transfer" and explicit_routing_correction_request(
+        state.get("message") or ""
+    ):
+        return "prepare_workflow"
+    if state.get("intent") == "workforce_analytics" and workforce_corrective_prepare_question(
         state.get("message") or ""
     ):
         return "prepare_workflow"

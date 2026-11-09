@@ -25,9 +25,14 @@ FOLLOWUP_CUE = re.compile(
     r"\bwhat if\b|"
     r"\b(what|how) about\b|"
     r"\bonly one week\b|"
+    r"\b(starting|from)\s+(?:\d{1,2}|january|february|march|april|may|june|july|august|"
+    r"september|october|november|december)\b|"
+    r"\bfor\s+(?:one|two|three|four|five|six|seven|\d+)\s+(?:working\s+)?days?\b|"
+    r"\bmake it\b|"
+    r"\b(review|prepare)\s+the\b|"
     r"\b(it|that|those|these|them|this|the first(?: one)?|the second(?: one)?|"
     r"the previous(?: one|request)?|the same|next month|that month|that department|"
-    r"that request|the previous request|instead|recommend)\b"
+    r"that request|the previous request|instead|recommend|these dates)\b"
     r")",
     re.IGNORECASE,
 )
@@ -104,6 +109,30 @@ def recent_messages(
                 for key in ("intent", "decision_summary", "confidence", "orchestration_mode")
                 if payload.get(key) not in (None, "", [], {})
             }
+            record_context = payload.get("record_context")
+            if isinstance(record_context, dict) and record_context.get("subject"):
+                compact["record_context"] = {
+                    key: record_context.get(key)
+                    for key in (
+                        "subject",
+                        "intent",
+                        "leave_type",
+                        "start",
+                        "end",
+                        "label",
+                        "business_days",
+                        "workflow_state",
+                        "focus",
+                        "filter",
+                        "request_id",
+                        "user_id",
+                        "employee_id",
+                    )
+                    if record_context.get(key) not in (None, "", [], {})
+                }
+            execution_result = payload.get("execution_result")
+            if isinstance(execution_result, dict) and execution_result.get("leave_request_id"):
+                compact["submitted_request_id"] = execution_result.get("leave_request_id")
             analysis = payload.get("analysis")
             if isinstance(analysis, dict):
                 compact["analysis_kind"] = analysis.get("kind") or analysis.get("focus")
@@ -111,6 +140,9 @@ def recent_messages(
                     compact["window"] = {"start": analysis.get("start"), "end": analysis.get("end")}
                 if analysis.get("remaining") is not None:
                     compact["remaining"] = analysis.get("remaining")
+                requested = analysis.get("requested_window") or {}
+                if requested.get("start") and not compact.get("record_context"):
+                    compact["window"] = {"start": requested.get("start"), "end": requested.get("end")}
             analytics = payload.get("analytics")
             if isinstance(analytics, dict):
                 compact["analytics_focus"] = analytics.get("focus")
@@ -146,6 +178,35 @@ def workflow_memory_from_history(history: list[dict[str, Any]]) -> dict[str, Any
             "analytics_months": state.get("analytics_months"),
             "cited_policies": state.get("cited_policies") or [],
         }
+    return {}
+
+
+def record_context_from_history(history: list[dict[str, Any]]) -> dict[str, Any]:
+    for item in reversed(history):
+        if item.get("role") != "assistant":
+            continue
+        state = item.get("state") or {}
+        submitted_id = state.get("submitted_request_id")
+        ctx = state.get("record_context") if isinstance(state.get("record_context"), dict) else {}
+        if submitted_id:
+            merged = dict(ctx)
+            if merged.get("subject") != "leave_history":
+                merged.update(
+                    {
+                        "subject": "leave_history",
+                        "intent": "leave_request_status",
+                        "request_id": int(submitted_id),
+                        "filter": "latest",
+                        "focus": "latest",
+                        "workflow_state": "SUBMITTED",
+                    }
+                )
+            else:
+                merged.setdefault("request_id", int(submitted_id))
+            if merged.get("subject"):
+                return merged
+        if isinstance(ctx, dict) and ctx.get("subject"):
+            return ctx
     return {}
 
 
@@ -351,9 +412,12 @@ def resolve_followup(
         hint = "leave_planning"
         leave_focus = "duration"
         matched = True
-    elif re.search(r"\bcan i take two weeks off next month\b", lowered):
+    elif re.search(
+        r"\bcan i take (?:leave|two weeks|time off).{0,30}(?:next month|from now|later)\b",
+        lowered,
+    ):
         rewritten = message
-        hint = "leave_planning"
+        hint = "leave_eligibility"
         matched = True
     elif re.search(r"\bwould that affect my team'?s coverage\b|\bteam'?s coverage\b|\benough coverage\b", lowered):
         rewritten = "Would the leave window we just discussed affect my team's coverage?"

@@ -57,6 +57,7 @@ def _names(db: Session) -> dict[int, str]:
 
 def _person(employee: Employee, departments: dict[int, str], names: dict[int, str]) -> dict:
     return {
+        "employee_id": employee.id,
         "full_name": employee.full_name,
         "employee_number": employee.employee_number,
         "job_title": employee.job_title,
@@ -151,6 +152,10 @@ def _context(subject: str, user_id: int, employee_id: int, **extra) -> dict:
         payload["prior_window"] = extra["prior_window"]
     if extra.get("focus"):
         payload["focus"] = extra["focus"]
+    if extra.get("subject_employee_id") is not None:
+        payload["subject_employee_id"] = extra["subject_employee_id"]
+    if extra.get("subject_name"):
+        payload["subject_name"] = extra["subject_name"]
     return payload
 
 
@@ -972,8 +977,82 @@ def _directory(db: Session, message: str, inherited: dict | None, target_ids: li
         context_kwargs["hire_filter"] = hire_filter
     elif inherited.get("hire_filter") and focus == "filtered_tenure":
         context_kwargs["hire_filter"] = inherited["hire_filter"]
+    if focus == "profile" and len(shown) == 1 and shown[0].get("employee_id") is not None:
+        context_kwargs["subject_employee_id"] = int(shown[0]["employee_id"])
+        context_kwargs["subject_name"] = shown[0].get("full_name") or ""
+        context_kwargs["focus"] = "profile"
     context = _context("employee_directory", 0, 0, **context_kwargs)
     return payload, context
+
+
+def _absenteeism_comparison_summary(prior: dict, latest: dict) -> dict:
+    """Deterministic month-to-month absenteeism change (unplanned = absent + sick)."""
+    prev_counts = prior["counts"]
+    lat_counts = latest["counts"]
+    prev_rec = int(prev_counts.get("recorded_days") or 0)
+    lat_rec = int(lat_counts.get("recorded_days") or 0)
+    prev_unp = int(prev_counts.get("unplanned_absent") or 0)
+    lat_unp = int(lat_counts.get("unplanned_absent") or 0)
+    prev_rate_exact = (100.0 * prev_unp / prev_rec) if prev_rec else None
+    lat_rate_exact = (100.0 * lat_unp / lat_rec) if lat_rec else None
+    point_delta = direction = None
+    relative_percent_change = None
+    relative_defined = False
+    relative_note = None
+    if prev_rate_exact is not None and lat_rate_exact is not None:
+        point_delta_exact = lat_rate_exact - prev_rate_exact
+        point_delta = round(point_delta_exact, 2)
+        if point_delta_exact > 0:
+            direction = "increased"
+        elif point_delta_exact < 0:
+            direction = "decreased"
+        else:
+            direction = "unchanged"
+        if prev_rate_exact == 0:
+            relative_note = (
+                "Relative percentage change is undefined because the baseline month absenteeism rate is 0% "
+                "(no unplanned absence rows in that month). Percentage-point and direction still apply."
+            )
+        else:
+            relative_percent_change = round(
+                ((lat_rate_exact - prev_rate_exact) / prev_rate_exact) * 100.0,
+                2,
+            )
+            relative_defined = True
+    elif prev_rec == 0 or lat_rec == 0:
+        relative_note = (
+            "Relative percentage change is undefined because a month has no stored attendance rows "
+            "in the requested window."
+        )
+    return {
+        "previous": {
+            "label": prior["label"],
+            "start": prior["start"],
+            "end": prior["end"],
+            "unplanned_absent": prev_unp,
+            "denominator": prev_rec,
+            "unplanned_absence_rate_pct": round(prev_rate_exact, 2) if prev_rate_exact is not None else None,
+        },
+        "latest": {
+            "label": latest["label"],
+            "start": latest["start"],
+            "end": latest["end"],
+            "unplanned_absent": lat_unp,
+            "denominator": lat_rec,
+            "unplanned_absence_rate_pct": round(lat_rate_exact, 2) if lat_rate_exact is not None else None,
+        },
+        "rate_point_delta": point_delta,
+        "direction": direction,
+        "relative_percent_change": relative_percent_change,
+        "relative_percent_change_defined": relative_defined,
+        "relative_percent_change_note": relative_note,
+        "numerator": "unplanned absence rows (attendance status absent or sick)",
+        "denominator": "stored attendance rows in the calendar month",
+        "formulas": {
+            "rate_point_delta": "latest absenteeism rate minus baseline rate (percentage points)",
+            "relative_percent_change": "((latest rate − baseline rate) / baseline rate) × 100",
+        },
+    }
 
 
 def _counts(rows: list[Attendance]) -> dict:
@@ -989,6 +1068,8 @@ def _counts(rows: list[Attendance]) -> dict:
     recorded = len(rows)
     worked = counts["present"] + counts["remote"] + counts["late"]
     absent_rate = round(100 * counts["absent"] / recorded, 2) if recorded else None
+    unplanned = counts["absent"] + counts["sick"]
+    unplanned_rate = round(100 * unplanned / recorded, 2) if recorded else None
     return {
         **counts,
         "recorded_days": recorded,
@@ -996,6 +1077,8 @@ def _counts(rows: list[Attendance]) -> dict:
         "attendance_percentage": round(100 * worked / recorded, 1) if recorded else None,
         "absent_employees": len(absent_employees),
         "absent_rate_pct": absent_rate,
+        "unplanned_absent": unplanned,
+        "unplanned_absence_rate_pct": unplanned_rate,
     }
 
 
@@ -1032,6 +1115,65 @@ def _period_snapshot(db: Session, employees: list[Employee], start: date, end: d
     }
 
 
+def _org_absenteeism_month_compare(
+    db: Session,
+    employees: list[Employee],
+    message: str,
+    inherited: dict | None,
+    department: Department | None,
+) -> tuple[dict, dict] | None:
+    """Full organization (or single department) calendar-month absenteeism comparison."""
+    today = org_today()
+    text = message.lower()
+    comparison = parse_comparison(message, today, inherited or {}, subject="org_attendance")
+    if not comparison or len(comparison) < 2:
+        return None
+    if not re.search(
+        r"\b(absenteeism|absence rates?|unplanned absence|attendance rates?)\b",
+        text,
+    ):
+        return None
+    if department is not None:
+        employees = [row for row in employees if row.department_id == department.id]
+    ids = [row.id for row in employees]
+    periods = []
+    for start, end, label in comparison:
+        rows = _attendance_rows(db, ids, start, end)
+        periods.append({"start": start.isoformat(), "end": end.isoformat(), "label": label, "counts": _counts(rows)})
+    prior = periods[0]
+    latest = periods[-1] if len(periods) > 1 else periods[0]
+    comparison_summary = _absenteeism_comparison_summary(prior, latest)
+    payload = {
+        "kind": "org_attendance",
+        "focus": "compare",
+        "department": department.name if department else "",
+        "employee_count": len(ids),
+        "periods": periods,
+        "comparison_summary": comparison_summary,
+        "note": (
+            "Absenteeism rate is unplanned absence (absent + sick) divided by stored attendance rows "
+            "for that calendar month only. Weekends are not inserted as absences."
+        ),
+    }
+    last = periods[-1]
+    context = _context(
+        "org_attendance",
+        0,
+        0,
+        department=payload["department"],
+        start=last["start"],
+        end=last["end"],
+        label=last["label"],
+    )
+    if len(periods) >= 2:
+        context["prior_window"] = {
+            "start": prior["start"],
+            "end": prior["end"],
+            "label": prior["label"],
+        }
+    return payload, context
+
+
 def _attendance(db: Session, message: str, inherited: dict | None) -> tuple[dict, dict]:
     today = org_today()
     text = message.lower()
@@ -1039,6 +1181,9 @@ def _attendance(db: Session, message: str, inherited: dict | None) -> tuple[dict
     department = _department_for(db, message, inherited)
     employees = db.query(Employee).filter(Employee.employment_status == "active").all()
     named_departments = _named_departments(db, message)
+    month_compare = _org_absenteeism_month_compare(db, employees, message, inherited, department)
+    if month_compare is not None:
+        return month_compare
     # Multi-turn: "What about October?" / "How much did it increase?" / "Which department contributed most?"
     # Keep org_attendance deterministic instead of inventing workforce-analytics figures.
     prior_start = inherited.get("start")
@@ -1068,6 +1213,7 @@ def _attendance(db: Session, message: str, inherited: dict | None) -> tuple[dict
         (inherited.get("subject") == "org_attendance" or asks_increase or asks_department_contrib)
         and (asks_increase or asks_department_contrib or month_switch)
         and (prior_start and prior_end or len(named_months) >= 2)
+        and month_compare is None
     ):
         prev_start = prev_end = None
         cur_start = cur_end = None
@@ -1314,25 +1460,6 @@ def _attendance(db: Session, message: str, inherited: dict | None) -> tuple[dict
         employees = [row for row in employees if row.department_id == department.id]
     ids = [row.id for row in employees]
     names = {row.id: row.full_name for row in employees}
-    comparison = parse_comparison(message, today, inherited, subject="org_attendance")
-    if comparison:
-        periods = []
-        for start, end, label in comparison:
-            rows = _attendance_rows(db, ids, start, end)
-            periods.append({"start": start.isoformat(), "end": end.isoformat(), "label": label, "counts": _counts(rows)})
-        payload = {
-            "kind": "org_attendance",
-            "focus": "compare",
-            "department": department.name if department else "",
-            "employee_count": len(ids),
-            "periods": periods,
-            "note": "The denominator for each percentage is the number of stored attendance rows in that window. Weekends are not added as absences.",
-        }
-        last = periods[-1]
-        return payload, _context(
-            "org_attendance", 0, 0, department=payload["department"], start=last["start"], end=last["end"], label=last["label"]
-        )
-
     if re.search(r"\bmissing attendance\b", text):
         return _missing(db, employees, names, department)
 

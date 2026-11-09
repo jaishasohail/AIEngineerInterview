@@ -354,18 +354,45 @@ def team_analytics_report(db: Session, manager: Employee, message: str, inherite
     departments = {row.id: row.name for row in db.query(Department).all()}
     today = org_today()
     inherited = inherited or {}
+    from app.ai.context import managed_leave_request_status_id
+
+    explicit_status_id = managed_leave_request_status_id(message)
+    if explicit_status_id is None and inherited.get("subject") in {"approval_decision", "approval_inbox"}:
+        inherit_id = inherited.get("request_id") or inherited.get("selected_request_id")
+        if inherit_id is not None and re.search(r"\b(status|updated|state)\b", text):
+            explicit_status_id = int(inherit_id)
+    if explicit_status_id is not None:
+        return _managed_leave_request_status(db, manager, members, departments, explicit_status_id)
     department = _team_department(db, message)
     if department is not None and re.search(r"\b(in|only|from|within)\b", text):
         scoped = [row for row in members if row.department_id == department.id]
     else:
         scoped, department = members, None
 
-    from app.ai.context import approval_inbox_followup_focus, approval_inbox_question
+    from app.ai.context import approval_inbox_followup_focus, approval_inbox_question, manager_leave_decision_guidance_question
 
     inbox_focus = approval_inbox_followup_focus(text)
+    pending_guidance_thread = str(inherited.get("focus") or "").startswith("awaiting_approval") and (
+        inherited.get("selected_request_id") is not None or inherited.get("request_id") is not None
+    )
     if (
         approval_inbox_question(text)
-        or inbox_focus in {"urgency", "why_urgent", "approve_impact", "reject_impact"}
+        or manager_leave_decision_guidance_question(text)
+        or (
+            pending_guidance_thread
+            and re.search(
+                r"\b(coverage|these dates|this request|that request|operational risks?|if i approve|if i reject)\b",
+                text,
+            )
+        )
+        or inbox_focus in {
+            "urgency",
+            "why_urgent",
+            "approve_impact",
+            "reject_impact",
+            "approve_guidance",
+            "reject_guidance",
+        }
         or (
             re.search(r"\bhighest (?:operational )?risk\b", text)
             and re.search(r"\b(request|approval|pending|which|one)\b", text)
@@ -376,14 +403,22 @@ def team_analytics_report(db: Session, manager: Employee, message: str, inherite
             inbox_focus in {"urgency", "why_urgent", "approve_impact", "reject_impact"}
             or re.search(r"\bhighest (?:operational )?risk\b", text)
         )
+        guidance_focus = inbox_focus
+        if guidance_focus is None and manager_leave_decision_guidance_question(message):
+            guidance_focus = approval_inbox_followup_focus(message) or "approve_guidance"
+        if guidance_focus is None and pending_guidance_thread and re.search(
+            r"\b(coverage|these dates|this request|that request|operational risks?)\b", text
+        ):
+            guidance_focus = "approve_guidance"
         return _awaiting_approval(
             db,
             manager,
             members,
             departments,
             rank_by_risk=rank_risk,
-            followup_focus=inbox_focus,
+            followup_focus=guidance_focus,
             inherited=inherited,
+            message=message,
         )
     # Project assignments and work locations are roster attributes of the manager's own reports.
     if re.search(r"\b(projects?|assigned to|assignments?|allocation|allocated)\b", text) and not re.search(
@@ -945,6 +980,123 @@ def _risk_rank(level: str | None) -> int:
     return order.get((level or "").lower(), 0)
 
 
+def _resolve_manager_pending_request(
+    db: Session,
+    manager: Employee,
+    members: list[Employee],
+    message: str,
+    inherited: dict | None,
+) -> tuple[LeaveRequest | None, Employee | None]:
+    """Pick the direct-report pending_manager request the manager is asking about."""
+    from app.ai.context import find_mentioned
+
+    inherited = inherited or {}
+    member_by_id = {row.id: row for row in members}
+    member_ids = list(member_by_id.keys())
+    rows = (
+        db.query(LeaveRequest)
+        .filter(
+            LeaveRequest.employee_id.in_(member_ids or [-1]),
+            LeaveRequest.status == "pending_manager",
+            LeaveRequest.routed_manager_id == manager.id,
+        )
+        .order_by(LeaveRequest.submitted_at.desc())
+        .all()
+    )
+    mentioned = find_mentioned(db, message, manager.id)
+    if mentioned:
+        target_ids = {row.id for row in mentioned}
+        matched = [row for row in rows if row.employee_id in target_ids]
+        if matched:
+            pick = matched[0]
+            return pick, member_by_id.get(pick.employee_id)
+        mentioned_person = mentioned[0]
+        return None, mentioned_person
+    selected_id = inherited.get("selected_request_id") or inherited.get("request_id")
+    if selected_id is not None:
+        pick = next((row for row in rows if row.id == int(selected_id)), None)
+        if pick is not None:
+            return pick, member_by_id.get(pick.employee_id)
+    lowered = (message or "").lower()
+    if re.search(r"\b(this|that|it)\b", lowered) and len(rows) == 1:
+        return rows[0], member_by_id.get(rows[0].employee_id)
+    return None, None
+
+
+def _compose_decision_guidance(
+    db: Session,
+    manager: Employee,
+    *,
+    request: LeaveRequest,
+    owner: Employee,
+    stance: str,
+) -> dict:
+    """Evidence bundle for approve/reject guidance — read-only, no mutations."""
+    from app.access import direct_report_ids
+    from app.services.leave_engine import assess_window, overlapping_leave
+
+    assessed = assess_window(
+        db,
+        owner,
+        request.start_date,
+        request.end_date,
+        leave_type=request.leave_type or "annual",
+    )
+    teammate_ids = [item for item in direct_report_ids(db, manager.id) if item != owner.id]
+    overlaps = overlapping_leave(
+        db,
+        teammate_ids,
+        request.start_date,
+        request.end_date,
+        exclude_request_id=request.id,
+    )
+    approved_overlaps = [row for row in overlaps if row.get("status") == "approved"]
+    pending_overlaps = [row for row in overlaps if row.get("status") in {"pending_manager", "pending_hr"}]
+    policy_blocks = list(assessed.get("hard_blocks") or [])
+    operational = list(assessed.get("risks") or [])
+    risk_level = assessed.get("risk_level") or "low"
+    if stance == "approve":
+        if policy_blocks:
+            recommendation = "hold_for_policy_review"
+            confidence = "high"
+        elif risk_level in {"blocked", "high"}:
+            recommendation = "cautious_with_coverage"
+            confidence = "medium"
+        elif risk_level == "medium":
+            recommendation = "reasonable_with_monitoring"
+            confidence = "medium"
+        else:
+            recommendation = "generally_reasonable"
+            confidence = "moderate"
+    else:
+        if policy_blocks:
+            recommendation = "policy_grounds_exist"
+            confidence = "medium"
+        elif risk_level in {"blocked", "high"}:
+            recommendation = "operational_grounds_exist"
+            confidence = "medium"
+        else:
+            recommendation = "limited_policy_grounds"
+            confidence = "low"
+    return {
+        "stance": stance,
+        "policy_violations": policy_blocks,
+        "operational_risks": operational,
+        "approved_overlaps": approved_overlaps,
+        "pending_overlaps": pending_overlaps,
+        "available_pct": assessed.get("available_pct"),
+        "critical_conflict": bool(assessed.get("critical_conflict")),
+        "hr_required": bool(assessed.get("hr_required") or request.hr_required),
+        "risk_level": risk_level,
+        "recommendation": recommendation,
+        "confidence": confidence,
+        "recommend_dates_note": (
+            "Overlaps or coverage pressure may be reduced by alternative dates; "
+            "ask for date recommendations only after you identify the request."
+        ),
+    }
+
+
 def _request_operational_risk(db: Session, row: LeaveRequest, owner: Employee | None) -> dict:
     """Use stored impact assessment when present; otherwise compute from leave_engine."""
     impact = row.impact_json if isinstance(row.impact_json, dict) else {}
@@ -979,6 +1131,67 @@ def _request_operational_risk(db: Session, row: LeaveRequest, owner: Employee | 
     }
 
 
+def _managed_leave_request_status(
+    db: Session,
+    manager: Employee,
+    members: list[Employee],
+    departments: dict[int, str],
+    request_id: int,
+) -> dict:
+    """Status of one leave request for a direct report (manager view)."""
+    member_ids = {row.id for row in members}
+    row = db.get(LeaveRequest, int(request_id))
+    if row is None:
+        return {
+            "kind": "team_analytics",
+            "focus": "leave_request_status",
+            "status": "not_found",
+            "team_size": len(members),
+            "people": [],
+            "people_count": 0,
+            "note": f"Leave request {request_id} was not found.",
+        }
+    if row.employee_id not in member_ids:
+        return {
+            "kind": "team_analytics",
+            "focus": "leave_request_status",
+            "status": "out_of_scope",
+            "team_size": len(members),
+            "people": [],
+            "people_count": 0,
+            "note": (
+                f"Leave request {request_id} is not for an employee on your reporting line. "
+                "Managers may only view status for their direct reports."
+            ),
+        }
+    person = next((m for m in members if m.id == row.employee_id), None)
+    person_payload = _person(person, departments) if person else {}
+    person_payload.update(
+        {
+            "request_id": row.id,
+            "leave_type": row.leave_type,
+            "status": row.status,
+            "start": row.start_date.isoformat(),
+            "end": row.end_date.isoformat(),
+            "business_days": row.business_days,
+        }
+    )
+    name = person_payload.get("full_name") or "The employee"
+    return {
+        "kind": "team_analytics",
+        "focus": "leave_request_status",
+        "status": row.status,
+        "team_size": len(members),
+        "people": [person_payload],
+        "people_count": 1,
+        "selected_request_id": row.id,
+        "note": (
+            f"Leave request {row.id} for {name} is {row.status.replace('_', ' ')} "
+            f"({row.start_date.isoformat()} to {row.end_date.isoformat()}, {row.business_days} business days)."
+        ),
+    }
+
+
 def _awaiting_approval(
     db: Session,
     manager: Employee,
@@ -988,9 +1201,16 @@ def _awaiting_approval(
     rank_by_risk: bool = False,
     followup_focus: str | None = None,
     inherited: dict | None = None,
+    message: str = "",
 ) -> dict:
     """Leave still pending where this manager is the routed/assigned approver."""
+    from app.ai.context import approval_inbox_followup_focus, manager_leave_decision_guidance_question
+
     inherited = inherited or {}
+    if followup_focus is None:
+        followup_focus = approval_inbox_followup_focus(message)
+        if followup_focus is None and manager_leave_decision_guidance_question(message):
+            followup_focus = "approve_guidance"
     member_ids = [row.id for row in members]
     rows = (
         db.query(LeaveRequest)
@@ -1040,8 +1260,93 @@ def _awaiting_approval(
         selected = next((item for item in people if item.get("request_id") == int(selected_id)), None)
     # Urgency ranking may default to the highest-risk request. Approve/reject impact must not
     # invent a request id when the conversation has not established one.
-    if selected is None and people and followup_focus not in {"approve_impact", "reject_impact"}:
+    if selected is None and people and followup_focus not in {
+        "approve_impact",
+        "reject_impact",
+        "approve_guidance",
+        "reject_guidance",
+    }:
         selected = people[0]
+    if followup_focus in {"approve_guidance", "reject_guidance"}:
+        stance = "approve" if followup_focus == "approve_guidance" else "reject"
+        request_row, owner = _resolve_manager_pending_request(db, manager, members, message, inherited)
+        focus = "awaiting_approval_approve_guidance" if stance == "approve" else "awaiting_approval_reject_guidance"
+        if request_row is None and owner is None and not people:
+            return {
+                "kind": "team_analytics",
+                "focus": focus,
+                "status": "needs_request",
+                "team_size": len(members),
+                "people": [],
+                "people_count": 0,
+                "note": (
+                    "No pending_manager leave requests are routed to you right now. "
+                    "Decision guidance requires an actual pending request for a direct report."
+                ),
+            }
+        if request_row is None and owner is not None:
+            return {
+                "kind": "team_analytics",
+                "focus": focus,
+                "status": "no_pending",
+                "subject_name": owner.full_name,
+                "team_size": len(members),
+                "people": [],
+                "people_count": 0,
+                "note": (
+                    f"{owner.full_name} has no leave request in pending_manager status routed to you. "
+                    "I cannot recommend approve/reject without a pending request."
+                ),
+            }
+        if request_row is None and people:
+            request_row = db.get(LeaveRequest, people[0].get("request_id"))
+            owner = by_id.get(request_row.employee_id) if request_row else None
+        if request_row is None or owner is None:
+            return {
+                "kind": "team_analytics",
+                "focus": focus,
+                "status": "needs_request",
+                "team_size": len(members),
+                "people": [],
+                "note": "Specify which direct report or leave request id you want guidance on.",
+            }
+        risk = _request_operational_risk(db, request_row, owner)
+        guidance = _compose_decision_guidance(
+            db, manager, request=request_row, owner=owner, stance=stance
+        )
+        item = _person(owner, departments)
+        item.update(
+            {
+                "request_id": request_row.id,
+                "leave_type": request_row.leave_type,
+                "status": request_row.status,
+                "start": request_row.start_date.isoformat(),
+                "end": request_row.end_date.isoformat(),
+                "business_days": request_row.business_days,
+                "risk_level": risk["risk_level"],
+                "risks": risk["risks"],
+                "critical_conflict": risk["critical_conflict"],
+                "available_pct": risk["available_pct"],
+                "hr_required": risk["hr_required"],
+                "overlap_count": len(risk["overlaps"]),
+                "guidance": guidance,
+            }
+        )
+        return {
+            "kind": "team_analytics",
+            "focus": focus,
+            "decision_guidance": guidance,
+            "decision": stance,
+            "team_size": len(members),
+            "people": [item],
+            "people_count": 1,
+            "highest": item,
+            "selected_request_id": request_row.id,
+            "note": (
+                "This is manager decision guidance only from stored leave, balance, and coverage analytics. "
+                "You remain the authorized decision-maker. No approval or rejection was executed."
+            ),
+        }
     if followup_focus == "why_urgent":
         target = selected or (people[0] if people else None)
         return {

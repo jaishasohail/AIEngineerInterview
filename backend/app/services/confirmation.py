@@ -6,6 +6,8 @@ Execution always re-checks authorization and current database state.
 
 from __future__ import annotations
 
+import re
+import time
 from datetime import date, datetime, timedelta
 from typing import Any
 
@@ -15,7 +17,14 @@ from app.access import AuthorizationError, employee_for_user
 from app.audit import write_audit
 from app.clock import utcnow
 from app.models import Approval, Conversation, Employee, LeaveRequest, PendingAction, User
-from app.services.actions import decide_approval, file_routing_correction, submit_leave
+from app.services.actions import (
+    decide_approval,
+    file_routing_correction,
+    record_hr_corrective_recommendation,
+    routing_correction_still_needed,
+    submit_leave,
+)
+from app.services.analytics_engine import absence_analytics, workforce_corrective_proposal
 from app.services.leave_engine import assess_window
 
 PENDING_TTL_MINUTES = 30
@@ -39,12 +48,26 @@ def idempotency_for_submit(*, employee_id: int, start: str, end: str, leave_type
     return f"submit_leave:{employee_id}:{start}:{end}:{leave_type}"
 
 
-def idempotency_for_decision(*, approval_id: int, decision: str) -> str:
-    return f"decide_approval:{approval_id}:{decision}"
+def idempotency_for_decision(*, approval_id: int, decision: str, owner_user_id: int | None = None) -> str:
+    base = f"decide_approval:{approval_id}:{decision}"
+    if owner_user_id is not None:
+        return f"{base}:u{owner_user_id}"
+    return base
 
 
 def idempotency_for_routing(*, employee_id: int, to_manager_id: int) -> str:
     return f"file_routing_correction:{employee_id}:{to_manager_id}"
+
+
+def idempotency_for_workforce_corrective(
+    *,
+    department: str,
+    period_start: str,
+    period_end: str,
+    owner_user_id: int,
+) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", (department or "").lower()).strip("-") or "dept"
+    return f"record_hr_corrective:{slug}:{period_start}:{period_end}:u{owner_user_id}"
 
 
 def public_pending(row: PendingAction) -> dict:
@@ -120,7 +143,9 @@ def create_or_reuse_pending(
     now = utcnow()
     if existing is not None:
         existing = expire_if_needed(db, existing, ip=ip)
-        if existing.status == "awaiting_confirmation":
+        if existing.owner_user_id != user.id:
+            existing = None
+        elif existing.status == "awaiting_confirmation":
             assert_owner(existing, user)
             # Refresh payload/conversation linkage for the active draft.
             existing.payload_json = payload
@@ -131,11 +156,28 @@ def create_or_reuse_pending(
             db.flush()
             _link_conversation(db, conversation_id, existing.id)
             return existing, False
-        if existing.status == "executed" and existing.result_json:
+        elif existing is not None and existing.status == "executed" and existing.result_json:
+            if action_type == "file_routing_correction":
+                correction = payload.get("correction") or {}
+                subject_id = int(correction.get("subject_employee_id") or user.employee_id or 0)
+                if routing_correction_still_needed(db, subject_id):
+                    assert_owner(existing, user)
+                    existing.status = "awaiting_confirmation"
+                    existing.payload_json = payload
+                    existing.result_json = None
+                    existing.conversation_id = conversation_id or existing.conversation_id
+                    existing.thread_id = thread_id or existing.thread_id
+                    existing.expires_at = _expiry(now)
+                    existing.confirmed_at = None
+                    existing.executed_at = None
+                    existing.updated_at = now
+                    db.flush()
+                    _link_conversation(db, conversation_id, existing.id)
+                    return existing, False
             # Duplicate prevention: surface the prior successful result.
             return existing, False
         # Re-arm cancelled/expired/failed/blocked rows under the same idempotency key.
-        if existing.status in {"cancelled", "expired", "failed", "blocked"}:
+        elif existing is not None and existing.status in {"cancelled", "expired", "failed", "blocked"}:
             assert_owner(existing, user)
             existing.status = "awaiting_confirmation"
             existing.payload_json = payload
@@ -190,15 +232,46 @@ def _link_conversation(db: Session, conversation_id: int | None, pending_id: int
         conversation.updated_at = utcnow()
 
 
-def clear_conversation_pending(db: Session, conversation_id: int | None) -> None:
+def clear_conversation_pending(db: Session, conversation_id: int | None, *, keep_reference: bool = False) -> None:
     if conversation_id is None:
         return
     conversation = db.get(Conversation, conversation_id)
     if conversation is not None:
-        conversation.pending_action_id = None
+        if not keep_reference:
+            conversation.pending_action_id = None
         if conversation.status == "awaiting_confirmation":
             conversation.status = "active"
         conversation.updated_at = utcnow()
+
+
+def already_executed_response(row: PendingAction) -> dict:
+    """Idempotent replay of a terminal pending action — no new writes."""
+    result = dict(row.result_json or {})
+    if row.action_type == "submit_leave":
+        request_id = result.get("leave_request_id")
+        message = (
+            "This leave request has already been submitted"
+            + (f" (request {request_id})" if request_id is not None else "")
+            + ". No duplicate request was created."
+        )
+    elif row.action_type == "decide_approval":
+        message = result.get("message") or (
+            "This approval decision was already recorded. Helios will not repeat it."
+        )
+    elif row.action_type == "record_hr_corrective_recommendation":
+        message = result.get("message") or (
+            "This corrective recommendation was already recorded. Helios will not record it again."
+        )
+    else:
+        message = result.get("message") or "That action was already executed. Helios will not repeat it."
+    return {
+        **result,
+        "status": "duplicate",
+        "message": message,
+        "summary": "Duplicate confirmation prevented.",
+        "pending_action_id": row.id,
+        "result": result,
+    }
 
 
 def cancel_pending(
@@ -220,6 +293,18 @@ def cancel_pending(
             "pending_action_id": row.id,
         }
     if row.status != "awaiting_confirmation":
+        if row.status == "cancelled":
+            return {
+                "status": "cancelled",
+                "message": (
+                    "Your prepared leave request has already been cancelled. Nothing was submitted."
+                    if row.action_type == "submit_leave"
+                    else "That action was already cancelled. Nothing was submitted."
+                ),
+                "summary": "Pending action already cancelled.",
+                "pending_action_id": row.id,
+                "result": row.result_json,
+            }
         return {
             "status": row.status,
             "message": f"That action is already {row.status}. No additional change was made.",
@@ -229,7 +314,8 @@ def cancel_pending(
         }
     row.status = "cancelled"
     row.updated_at = utcnow()
-    clear_conversation_pending(db, row.conversation_id)
+    keep_ref = row.action_type == "record_hr_corrective_recommendation"
+    clear_conversation_pending(db, row.conversation_id, keep_reference=keep_ref)
     write_audit(
         db,
         actor_user_id=user.id,
@@ -242,10 +328,16 @@ def cancel_pending(
         commit=False,
     )
     db.flush()
+    if row.action_type == "submit_leave":
+        message = "Your prepared leave request has been cancelled. Nothing was submitted."
+        summary = "Prepared leave request cancelled."
+    else:
+        message = "I did not submit anything. Official records are unchanged."
+        summary = "Confirmation was declined."
     return {
         "status": "cancelled",
-        "message": "I did not submit anything. Official records are unchanged.",
-        "summary": "Confirmation was declined.",
+        "message": message,
+        "summary": summary,
         "pending_action_id": row.id,
     }
 
@@ -259,6 +351,30 @@ def revalidate_pending(db: Session, user: User, row: PendingAction) -> None:
             "That pending action expired before confirmation. Prepare the action again.",
             status="expired",
         )
+    if row.status == "executing":
+        for _ in range(40):
+            db.refresh(row)
+            if row.status == "executed" and row.result_json:
+                raise ConfirmationError(
+                    "That action was already executed. Helios will not repeat it.",
+                    status="duplicate",
+                    details={"result": row.result_json},
+                )
+            if row.status == "awaiting_confirmation":
+                break
+            time.sleep(0.05)
+        db.refresh(row)
+        if row.status == "executed" and row.result_json:
+            raise ConfirmationError(
+                "That action was already executed. Helios will not repeat it.",
+                status="duplicate",
+                details={"result": row.result_json},
+            )
+        if row.status == "executing":
+            raise ConfirmationError(
+                "This confirmation is already being processed. Wait for the first submission to finish.",
+                status="duplicate",
+            )
     if row.status == "executed":
         raise ConfirmationError(
             "That action was already executed. Helios will not repeat it.",
@@ -366,6 +482,31 @@ def revalidate_pending(db: Session, user: User, row: PendingAction) -> None:
             )
         return
 
+    if row.action_type == "record_hr_corrective_recommendation":
+        if user.role != "hr_admin":
+            raise ConfirmationError(
+                "Only HR administrators can record organization-wide corrective recommendations.",
+                status="denied",
+            )
+        proposal = payload.get("proposal") or {}
+        months = int(proposal.get("months") or 3)
+        live = absence_analytics(db, user, months=months)
+        live_proposal = workforce_corrective_proposal(live)
+        if live_proposal is None:
+            raise ConfirmationError(
+                "Current analytics no longer support this corrective recommendation.",
+                status="blocked",
+            )
+        expected = proposal.get("target_department")
+        live_dept = live_proposal.get("target_department")
+        if expected and live_dept and expected != live_dept:
+            raise ConfirmationError(
+                f"The highest absenteeism department is now {live_dept}, not {expected}. Prepare the action again.",
+                status="blocked",
+                details={"expected_department": expected, "live_department": live_dept},
+            )
+        return
+
     raise ConfirmationError(f"Unsupported pending action type '{row.action_type}'.", status="error")
 
 
@@ -386,23 +527,44 @@ def execute_pending(
     option_id: str | None = None,
     ip: str | None = None,
 ) -> dict:
+    locked = db.get(PendingAction, row.id, with_for_update=True)
+    if locked is None:
+        return {
+            "status": "not_found",
+            "message": "The pending action could not be found.",
+            "summary": "No record was changed.",
+            "pending_action_id": row.id,
+        }
+    row = locked
+    expire_if_needed(db, row, ip=ip)
+    if row.status == "cancelled":
+        return {
+            "status": "cancelled",
+            "message": (
+                "Your prepared leave request has been cancelled. Nothing was submitted."
+                if row.action_type == "submit_leave"
+                else "That action was cancelled. Nothing was submitted."
+            ),
+            "summary": "Pending action cancelled.",
+            "pending_action_id": row.id,
+        }
+    if row.status == "executed" and row.result_json:
+        clear_conversation_pending(db, row.conversation_id, keep_reference=True)
+        return already_executed_response(row)
     try:
         revalidate_pending(db, user, row)
     except ConfirmationError as exc:
+        if exc.status == "duplicate" and row.result_json:
+            clear_conversation_pending(db, row.conversation_id, keep_reference=True)
+            return already_executed_response(row)
         row.status = "failed" if exc.status not in {"expired", "duplicate", "denied", "blocked", "needs_reason"} else (
             "expired" if exc.status == "expired" else row.status
         )
         if exc.status in {"blocked", "denied", "needs_reason", "not_found"}:
             row.status = "blocked"
         if exc.status == "duplicate" and row.result_json:
-            clear_conversation_pending(db, row.conversation_id)
-            return {
-                "status": "duplicate",
-                "message": exc.message,
-                "summary": "Duplicate action prevented.",
-                "pending_action_id": row.id,
-                "result": row.result_json,
-            }
+            clear_conversation_pending(db, row.conversation_id, keep_reference=True)
+            return already_executed_response(row)
         row.updated_at = utcnow()
         row.result_json = {"status": exc.status, "message": exc.message, "details": exc.details}
         clear_conversation_pending(db, row.conversation_id)
@@ -429,6 +591,9 @@ def execute_pending(
     payload = dict(row.payload_json or {})
     now = utcnow()
     row.confirmed_at = now
+    row.status = "executing"
+    row.updated_at = now
+    db.flush()
     try:
         if row.action_type == "submit_leave":
             option = _selected_option(payload, option_id)
@@ -462,6 +627,15 @@ def execute_pending(
                 user,
                 correction=correction,
                 subject_employee_id=correction.get("subject_employee_id"),
+                ip_address=ip,
+            )
+        elif row.action_type == "record_hr_corrective_recommendation":
+            proposal = payload.get("proposal") or {}
+            result = record_hr_corrective_recommendation(
+                db,
+                user,
+                proposal=proposal,
+                pending_action_id=row.id,
                 ip_address=ip,
             )
         else:
@@ -513,7 +687,7 @@ def execute_pending(
             "pending_action_id": row.id,
         }
 
-    success_statuses = {"submitted", "approved", "rejected", "pending_hr", "noop"}
+    success_statuses = {"submitted", "approved", "rejected", "pending_hr", "noop", "recorded"}
     status = str(result.get("status") or "error")
     if status not in success_statuses and status != "blocked":
         # Do not mark executed for unexpected outcomes.
@@ -543,7 +717,7 @@ def execute_pending(
     row.executed_at = utcnow()
     row.updated_at = utcnow()
     row.result_json = result
-    clear_conversation_pending(db, row.conversation_id)
+    clear_conversation_pending(db, row.conversation_id, keep_reference=True)
     write_audit(
         db,
         actor_user_id=user.id,
@@ -620,7 +794,7 @@ def prepare_decision_pending(
     thread_id: str | None = None,
     ip: str | None = None,
 ) -> dict:
-    key = idempotency_for_decision(approval_id=approval_id, decision=decision)
+    key = idempotency_for_decision(approval_id=approval_id, decision=decision, owner_user_id=user.id)
     label = f"{decision.title()} leave request {request_id or approval_id}"
     payload = {
         "type": "decide_approval",
@@ -680,13 +854,20 @@ def prepare_routing_pending(
     )
     to_name = correction.get("to_name") or "the current manager"
     from_name = correction.get("from_name") or "the previous manager"
-    payload = {
-        "type": "file_routing_correction",
-        "confirmation_prompt": (
+    if user.role == "hr_admin":
+        confirm_line = (
+            f"Apply this routing correction for employee #{subject_id}? "
+            f"It will move approval_manager_id from {from_name} to {to_name} and re-route open manager-stage leave requests."
+        )
+    else:
+        confirm_line = (
             f"File this routing correction for People Operations on employee #{subject_id}? "
             f"It would move approval_manager_id from {from_name} to {to_name}. "
             "The official record will not change until HR approves it."
-        ),
+        )
+    payload = {
+        "type": "file_routing_correction",
+        "confirmation_prompt": confirm_line,
         "options": {"primary": {"id": "primary", "label": "File the HR correction"}},
         "default_option": "primary",
         "correction": correction,
@@ -704,4 +885,82 @@ def prepare_routing_pending(
         thread_id=thread_id,
         ip=ip,
     )
+    if row.status == "executed" and row.result_json and not routing_correction_still_needed(db, subject_id):
+        return {
+            **public_pending(row),
+            "already_executed": True,
+            "prior_result": row.result_json,
+        }
+    return public_pending(row)
+
+
+def prepare_workforce_corrective_pending(
+    db: Session,
+    user: User,
+    *,
+    conversation_id: int | None,
+    proposal: dict,
+    thread_id: str | None = None,
+    ip: str | None = None,
+) -> dict:
+    if user.role != "hr_admin":
+        raise ConfirmationError(
+            "Only HR administrators can prepare organization-wide corrective actions.",
+            status="denied",
+        )
+    period = proposal.get("analytics_period") or {}
+    period_start = str(period.get("start") or "")
+    period_end = str(period.get("end") or "")
+    dept = proposal.get("target_department") or "selected department"
+    key = idempotency_for_workforce_corrective(
+        department=dept,
+        period_start=period_start,
+        period_end=period_end,
+        owner_user_id=user.id,
+    )
+    confirm_line = (
+        f"Record this HR corrective recommendation for {dept}? "
+        "It is advisory only: Helios will log the recommendation in audit history and will not change "
+        "attendance, leave, or employee records in PostgreSQL."
+    )
+    payload = {
+        "type": "record_hr_corrective_recommendation",
+        "confirmation_prompt": confirm_line,
+        "options": {"primary": {"id": "primary", "label": "Record the corrective recommendation"}},
+        "default_option": "primary",
+        "proposal": proposal,
+        "target_department": dept,
+        "identified_issue": proposal.get("identified_issue"),
+        "proposed_corrective_action": proposal.get("proposed_corrective_action"),
+        "supporting_evidence": proposal.get("supporting_evidence"),
+        "expected_outcome": proposal.get("expected_outcome"),
+        "owner_user_id": user.id,
+        "advisory_only": True,
+        "workflow_state": "AWAITING_CONFIRMATION",
+    }
+    row, _created = create_or_reuse_pending(
+        db,
+        user=user,
+        conversation_id=conversation_id,
+        action_type="record_hr_corrective_recommendation",
+        payload=payload,
+        idempotency_key=key,
+        thread_id=thread_id,
+        ip=ip,
+    )
+    if row.status == "executed" and row.result_json:
+        # Allow HR to re-open confirmation for a refreshed advisory recommendation draft.
+        # Execution remains idempotent via execute_pending / already_executed_response.
+        now = utcnow()
+        row.status = "awaiting_confirmation"
+        row.result_json = None
+        row.payload_json = payload
+        row.expires_at = _expiry(now)
+        row.confirmed_at = None
+        row.executed_at = None
+        row.updated_at = now
+        row.conversation_id = conversation_id or row.conversation_id
+        row.thread_id = thread_id or row.thread_id
+        db.flush()
+        _link_conversation(db, conversation_id, row.id)
     return public_pending(row)

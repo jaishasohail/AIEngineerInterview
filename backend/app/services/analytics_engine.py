@@ -172,7 +172,18 @@ def absence_analytics(db: Session, actor: User, months: int = 3) -> dict:
     month_comparison = _month_comparison(monthly_rows, compare_months)
     office_comparison = _office_comparison(location_monthly_rows, compare_months)
     investigation = _investigation_ranking(department_rows, month_comparison, anomalies)
-    recommendations = _recommendations(investigation, month_comparison, office_comparison, anomalies, scope)
+    utilization_map = utilization
+    workforce_risk_findings = _workforce_risk_findings(
+        investigation, utilization_map, month_comparison, department_rows, anomalies
+    )
+    recommendations = _recommendations(
+        investigation,
+        month_comparison,
+        office_comparison,
+        anomalies,
+        scope,
+        workforce_risk_findings=workforce_risk_findings,
+    )
     priority_employees = []
     for employee_id, unplanned in sorted(employee_unplanned.items(), key=lambda item: (-item[1], name_of.get(item[0], ""))):
         scheduled = employee_scheduled.get(employee_id, 0)
@@ -214,6 +225,7 @@ def absence_analytics(db: Session, actor: User, months: int = 3) -> dict:
         "investigation": investigation,
         "priority_employees": priority_employees,
         "recommendations": recommendations,
+        "workforce_risk_findings": workforce_risk_findings,
         "anomalies": anomalies,
         "leave_utilization": [
             {"department": name, "utilization": value} for name, value in sorted(utilization.items())
@@ -389,12 +401,151 @@ def _investigation_ranking(
     return ranked
 
 
+def _workforce_risk_findings(
+    investigation: list[dict],
+    utilization: dict[str, float],
+    month_comparison: dict,
+    departments: list[dict],
+    anomalies: list[dict],
+) -> list[dict]:
+    dept_rates = {row["department"]: float(row.get("unplanned_absence_rate") or 0) for row in departments}
+    org_rate = _rate(
+        sum(int(row.get("unplanned_absent") or 0) for row in departments),
+        sum(int(row.get("scheduled_days") or 0) for row in departments),
+    )
+    anomaly_by_dept: dict[str, list[dict]] = defaultdict(list)
+    for item in anomalies:
+        anomaly_by_dept[item["department"]].append(item)
+    findings = []
+    for item in investigation[:8]:
+        name = item["department"]
+        measured: list[str] = []
+        inferred: list[str] = []
+        limits: list[str] = []
+        rate = float(item.get("unplanned_absence_rate") or 0)
+        scheduled = int(item.get("scheduled_days") or 0)
+        unplanned = int(item.get("unplanned_absent") or 0)
+        measured.append(
+            f"Unplanned absence rate {rate:.1%} ({unplanned}/{scheduled} stored weekday attendance rows) "
+            f"in the analytics window."
+        )
+        change_pp = float(item.get("month_change_pp") or 0)
+        if change_pp != 0:
+            measured.append(f"Month-to-month change between complete calendar months: {change_pp:+.2f} percentage points.")
+        util = utilization.get(name)
+        if util is not None and util > 0:
+            measured.append(
+                f"Annual leave utilization {util:.1%} (used/entitled leave-balance days in 2026 for active employees in this department)."
+            )
+        why = []
+        if rate >= org_rate * 1.15 and org_rate > 0:
+            why.append(f"Rate exceeds the organization scoped average ({org_rate:.1%}).")
+        if rate >= 0.10:
+            why.append("Unplanned absence rate is at or above 10% in the analytics window.")
+        if change_pp > 0.5:
+            inferred.append(
+                "Rising month-to-month unplanned absence may pressure staffing coverage; "
+                "this is an inferred operational risk, not a confirmed staffing shortage."
+            )
+        if item.get("anomaly_count"):
+            measured.append(
+                f"{item['anomaly_count']} department-month(s) crossed the statistical anomaly threshold (z≥1.5)."
+            )
+        if item.get("small_sample"):
+            limits.append(
+                f"Only {scheduled} weekday attendance rows for {name}; treat rankings as indicative, not definitive."
+            )
+        if not why and not inferred and not limits:
+            why.append("Ranked by transparent investigation score combining rate, month change, volume, and anomalies.")
+        findings.append(
+            {
+                "department": name,
+                "investigation_score": item.get("score"),
+                "risk_level": (
+                    "elevated"
+                    if not item.get("small_sample") and float(item.get("score") or 0) >= 8
+                    else "review (small sample)" if item.get("small_sample")
+                    else "moderate"
+                ),
+                "measured_facts": measured,
+                "risk_reasons": why,
+                "inferred_operational_risks": inferred,
+                "limitations": limits,
+                "metrics": item.get("criteria") or {},
+            }
+        )
+    return findings
+
+
+def _grounded_action_plan(investigation: list[dict], workforce_risk_findings: list[dict]) -> list[dict]:
+    findings_by_dept = {row["department"]: row for row in workforce_risk_findings}
+    plan = []
+    for rank, item in enumerate(investigation[:5], start=1):
+        dept = item["department"]
+        finding = findings_by_dept.get(dept) or {}
+        small = bool(item.get("small_sample"))
+        score = float(item.get("score") or 0)
+        if small:
+            priority = "low (validate data first)"
+            action = (
+                f"Validate attendance data completeness for {dept} before workforce interventions; "
+                "re-run analytics after the next full calendar month."
+            )
+            outcome = f"At least {max(40, int(item.get('scheduled_days') or 0))} weekday rows recorded for {dept} in the next month review."
+        else:
+            priority = "high" if score >= 12 else "medium" if score >= 6 else "standard review"
+            action = (
+                f"HR Business Partner to review unplanned absence patterns with the {dept} manager "
+                "using stored attendance rows only (no personnel action without separate process)."
+            )
+            outcome = (
+                f"Documented review completed; month-to-month unplanned rate for {dept} tracked vs current "
+                f"{float(item.get('unplanned_absence_rate') or 0):.1%} baseline."
+            )
+        plan.append(
+            {
+                "rank": rank,
+                "issue": f"Workforce availability risk in {dept}",
+                "recommended_action": action,
+                "responsible_role": f"HR Business Partner + {dept} line manager",
+                "priority": priority,
+                "evidence": {
+                    "unplanned_absence_rate": float(item.get("unplanned_absence_rate") or 0),
+                    "unplanned_absent": int(item.get("unplanned_absent") or 0),
+                    "scheduled_days": int(item.get("scheduled_days") or 0),
+                    "month_change_pp": float(item.get("month_change_pp") or 0),
+                    "anomaly_count": int(item.get("anomaly_count") or 0),
+                    "investigation_score": score,
+                    "measured_facts": finding.get("measured_facts") or [],
+                },
+                "measurable_outcome": outcome,
+            }
+        )
+    plan.append(
+        {
+            "rank": 0,
+            "issue": "Governance",
+            "recommended_action": (
+                "Use HR attendance and leave policies for any formal corrective steps; "
+                "these analytics do not approve leave, change records, or diagnose individual conduct."
+            ),
+            "responsible_role": "HR Administrator",
+            "priority": "policy compliance",
+            "evidence": {"source": "deterministic analytics only; retrieve policies separately if needed"},
+            "measurable_outcome": "No automated HRIS mutations from this analytics thread.",
+        }
+    )
+    return plan
+
+
 def _recommendations(
     investigation: list[dict],
     month_comparison: dict,
     office_comparison: dict,
     anomalies: list[dict],
     scope: str,
+    *,
+    workforce_risk_findings: list[dict] | None = None,
 ) -> dict:
     if scope != "organization":
         return {
@@ -438,9 +589,13 @@ def _recommendations(
     )
     prev = month_comparison.get("previous") or {}
     latest = month_comparison.get("latest") or {}
+    risk_findings = workforce_risk_findings or []
+    action_plan = _grounded_action_plan(investigation, risk_findings) if scope == "organization" else []
     return {
         "actions": actions,
         "grounded_in": grounded,
+        "action_plan": action_plan,
+        "workforce_risk_findings": risk_findings,
         "date_ranges": {
             "analytics_window": "current absence_analytics period",
             "month_comparison_previous": prev,
@@ -534,3 +689,75 @@ def _insights(departments: list[dict], anomalies: list[dict], org_rate: float, u
         )
     insights.append("These figures describe the synthetic attendance extract. They are not a finding about employee conduct.")
     return insights
+
+
+def workforce_corrective_proposal(payload: dict) -> dict | None:
+    """Grounded corrective proposal for the highest unplanned-absence department (HR Admin org scope)."""
+    if payload.get("scope") != "organization":
+        return None
+    departments = payload.get("departments") or []
+    investigation = payload.get("investigation") or []
+    ranked = sorted(
+        departments,
+        key=lambda item: (
+            -float(item.get("unplanned_absence_rate") or 0),
+            -int(item.get("unplanned_absent") or 0),
+            item.get("department") or "",
+        ),
+    )
+    top_row = ranked[0] if ranked else (investigation[0] if investigation else None)
+    if not top_row:
+        return None
+    dept_name = top_row.get("department")
+    if not dept_name:
+        return None
+    rec = payload.get("recommendations") or {}
+    plan = rec.get("action_plan") or []
+    step = next(
+        (item for item in plan if item.get("rank", 0) > 0 and dept_name in str(item.get("issue") or "")),
+        None,
+    )
+    if step is None:
+        step = next((item for item in plan if item.get("rank", 0) > 0), None)
+    if step:
+        return {
+            "target_type": "department",
+            "target_department": dept_name,
+            "identified_issue": step.get("issue"),
+            "proposed_corrective_action": step.get("recommended_action"),
+            "supporting_evidence": step.get("evidence") or {},
+            "expected_outcome": step.get("measurable_outcome"),
+            "priority": step.get("priority"),
+            "responsible_role": step.get("responsible_role"),
+            "analytics_period": payload.get("period"),
+            "months": (payload.get("period") or {}).get("months"),
+            "scope": payload.get("scope"),
+            "advisory_only": True,
+        }
+    cornerstone_rate = float(top_row.get("unplanned_absence_rate") or 0)
+    return {
+        "target_type": "department",
+        "target_department": dept_name,
+        "identified_issue": f"Workforce availability risk in {dept_name}",
+        "proposed_corrective_action": (
+            f"HR Business Partner to review unplanned absence patterns with the {dept_name} manager "
+            "using stored attendance rows only (no personnel action without separate process)."
+        ),
+        "supporting_evidence": {
+            "unplanned_absence_rate": cornerstone_rate,
+            "unplanned_absent": int(top_row.get("unplanned_absent") or 0),
+            "scheduled_days": int(top_row.get("scheduled_days") or 0),
+            "month_change_pp": float(top_row.get("month_change_pp") or 0),
+            "anomaly_count": int(top_row.get("anomaly_count") or 0),
+        },
+        "expected_outcome": (
+            f"Documented review completed; month-to-month unplanned rate for {dept_name} tracked vs current "
+            f"{cornerstone_rate:.1%} baseline."
+        ),
+        "priority": "high" if cornerstone_rate >= 0.12 else "medium",
+        "responsible_role": f"HR Business Partner + {dept_name} line manager",
+        "analytics_period": payload.get("period"),
+        "months": (payload.get("period") or {}).get("months"),
+        "scope": payload.get("scope"),
+        "advisory_only": True,
+    }

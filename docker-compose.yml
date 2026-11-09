@@ -27,6 +27,7 @@ services:
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       PYTHONUNBUFFERED: "1"
       CHECKPOINT_PATH: /data/checkpoints.sqlite
+      CHECKPOINT_STORE: sqlite
       ORG_CLOCK: "2026-11-07"
       JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required}
       AUTO_SEED: "true"

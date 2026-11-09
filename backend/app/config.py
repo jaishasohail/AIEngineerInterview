@@ -33,6 +33,10 @@ class Settings(BaseSettings):
     environment: str = "development"
     database_url: str = DEV_DATABASE_URL
     checkpoint_path: str = str(BACKEND_ROOT / "data" / "checkpoints.sqlite")
+    # auto (default): checkpoints on CHECKPOINT_PATH even when DATABASE_URL is PostgreSQL.
+    # postgres: co-locate LangGraph state in PostgreSQL (not recommended for long-running dev/test).
+    # sqlite: always use CHECKPOINT_PATH.
+    checkpoint_store: str = "auto"
     jwt_secret: str = DEV_JWT_SECRET
     jwt_algorithm: str = "HS256"
     jwt_ttl_hours: int = 12
